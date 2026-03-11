@@ -1,0 +1,16 @@
+[Unit]
+Description=Sensor Alert Engine
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/alert-engine -config /etc/alert-engine/rules.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

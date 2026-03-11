@@ -1,0 +1,30 @@
+mqtt:
+  broker: "tcp://<services-lan-ip>:1883"
+  client_id: "alert-engine"
+
+alert_topic: "sensors/alerts"
+
+rules:
+  # Garage door contact sensor — alert if open for 30+ minutes
+  - name: garage_door_left_open
+    topic: "zigbee2mqtt/garage_door_1"
+    condition:
+      field: "contact"
+      operator: "eq"
+      value: false
+    duration_minutes: 30
+    repeat_minutes: 60
+    severity: "warning"
+    message: "Garage door has been open for {duration}"
+
+  # Water/moisture leak sensor — alert immediately
+  - name: moisture_detected
+    topic: "zigbee2mqtt/moisture_1"
+    condition:
+      field: "water_leak"
+      operator: "eq"
+      value: true
+    duration_minutes: 0
+    repeat_minutes: 30
+    severity: "critical"
+    message: "Water leak detected at {device}"
