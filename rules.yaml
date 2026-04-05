@@ -1,13 +1,19 @@
+# Example alert rules for sensor-alert-engine
+#
+# Copy this file to your deploy repo and customize with your device names.
+# When running in Docker Compose alongside Mosquitto, use "tcp://mosquitto:1883"
+# as the broker address.
+
 mqtt:
-  broker: "tcp://<services-lan-ip>:1883"
+  broker: "tcp://mosquitto:1883"
   client_id: "alert-engine"
 
 alert_topic: "sensors/alerts"
 
 rules:
-  # Garage door contact sensor — alert if open for 30+ minutes
+  # Garage door contact sensor -- alert if open for 30+ minutes
   - name: garage_door_left_open
-    topic: "zigbee2mqtt/garage_door_1"
+    topic: "zigbee2mqtt/my_garage_door"
     condition:
       field: "contact"
       operator: "eq"
@@ -17,9 +23,9 @@ rules:
     severity: "warning"
     message: "Garage door has been open for {duration}"
 
-  # Water/moisture leak sensor — alert immediately
+  # Water/moisture leak sensor -- alert immediately
   - name: moisture_detected
-    topic: "zigbee2mqtt/moisture_1"
+    topic: "zigbee2mqtt/my_moisture_sensor"
     condition:
       field: "water_leak"
       operator: "eq"
