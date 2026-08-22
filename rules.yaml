@@ -1,8 +1,10 @@
-# Example alert rules for sensor-alert-engine
+# Example rules for the alert / automation engine.
 #
-# Copy this file to your deploy repo and customize with your device names.
-# When running in Docker Compose alongside Mosquitto, use "tcp://mosquitto:1883"
-# as the broker address.
+# See README.md for the full rule reference. Copy this file to your deploy repo
+# and customize with your device names. When running in Docker Compose
+# alongside Mosquitto, use "tcp://mosquitto:1883" as the broker address.
+#
+# A rule watches one topic, tests one field, and then alerts, acts, or both.
 
 mqtt:
   broker: "tcp://mosquitto:1883"
@@ -34,3 +36,42 @@ rules:
     repeat_minutes: 30
     severity: "critical"
     message: "Water leak detected at {device}"
+
+  # Motion -> light, with manual override. An `action:` fires on the rising
+  # edge (no duration threshold) and can command any MQTT topic.
+  #
+  # override_topic points at the light's own /set topic so a command from ANY
+  # source -- HomeKit, a dashboard, mosquitto_pub -- counts as "a human took
+  # over" and pauses automation for the TTL. Publishing `true` to enable_topic
+  # hands control straight back.
+  - name: hallway_motion_light
+    topic: "zigbee2mqtt/my_motion_sensor"
+    condition:
+      field: "occupancy"
+      operator: "eq"
+      value: true
+    action:
+      topic: "zigbee2mqtt/my_light/set"
+      payload: '{"state":"ON","brightness":120}'
+      off_payload: '{"state":"OFF"}'
+      off_delay_seconds: 120
+      override_topic: "zigbee2mqtt/my_light/set"
+      override_ttl_minutes: 30
+      enable_topic: "automation/hallway/enable"
+      state_topic: "automation/hallway/owner"
+
+  # A rule can do both: notify AND act on the same condition.
+  - name: freezer_too_warm
+    topic: "zigbee2mqtt/my_freezer_sensor"
+    condition:
+      field: "temperature"
+      operator: "gt"
+      value: 10
+    alert:
+      duration_minutes: 15
+      repeat_minutes: 30
+      severity: "critical"
+      message: "Freezer above 10F for {duration}"
+    action:
+      topic: "notify/siren/set"
+      payload: '{"state":"ON"}'
