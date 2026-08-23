@@ -77,8 +77,9 @@ func main() {
 // filled in once the engine exists. Guarded because paho invokes OnConnect
 // from its own goroutine.
 type onConnect struct {
-	mu sync.Mutex
-	fn func() error
+	mu      sync.Mutex
+	fn      func() error
+	running bool
 }
 
 func (o *onConnect) set(fn func() error) {
@@ -93,10 +94,51 @@ func (o *onConnect) get() func() error {
 	return o.fn
 }
 
+// enter claims the right to run the resubscribe pass, returning false if
+// another goroutine is already inside one. leave releases the claim.
+func (o *onConnect) enter() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.running {
+		return false
+	}
+	o.running = true
+	return true
+}
+
+func (o *onConnect) leave() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.running = false
+}
+
+// uniqueClientID suffixes the configured client ID with the hostname and PID.
+//
+// MQTT allows exactly one live connection per client ID: a second connect
+// using the same ID makes the broker evict the first, which the evicted side
+// sees as a bare EOF. With a fixed ID any overlap -- a restart whose old
+// session the broker has not yet reaped, a redeploy that briefly runs two
+// containers, or a reconnect racing its own predecessor -- turns into two
+// sessions repeatedly kicking each other off. That is the 2026-08-23 stall:
+// four EOF disconnects in six seconds, after which the surviving client held
+// a socket the broker had already discarded and received nothing for five
+// hours while still reporting healthy.
+//
+// The suffix makes collisions impossible, so a reconnect can never evict
+// itself and an overlapping deploy degrades to two independent clients rather
+// than a takeover loop.
+func uniqueClientID(base string) string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%s-%d", base, host, os.Getpid())
+}
+
 func connectMQTT(mqttCfg config.MQTTConfig, hook *onConnect) (mqtt.Client, error) {
 	opts := mqtt.NewClientOptions().
 		AddBroker(mqttCfg.Broker).
-		SetClientID(mqttCfg.ClientID).
+		SetClientID(uniqueClientID(mqttCfg.ClientID)).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second).
@@ -121,6 +163,20 @@ func connectMQTT(mqttCfg config.MQTTConfig, hook *onConnect) (mqtt.Client, error
 			// Re-subscribe on EVERY connect. With CleanSession the broker
 			// drops all subscriptions on disconnect and paho does not restore
 			// them, so without this the client reconnects and goes silent.
+			//
+			// enter() collapses overlapping invocations: paho can fire
+			// OnConnect from more than one goroutine (the initial Connect and
+			// the auto-reconnect path both do), and each concurrent pass used
+			// to register a second handler for every topic -- visible in the
+			// logs as each topic being "subscribed" twice. Duplicate handlers
+			// mean every inbound message is processed twice, which for an
+			// edge-triggered action rule means the command is published twice.
+			if !hook.enter() {
+				slog.Warn("resubscribe already in progress, skipping duplicate OnConnect")
+				return
+			}
+			defer hook.leave()
+
 			if fn := hook.get(); fn != nil {
 				if err := fn(); err != nil {
 					slog.Error("resubscribe after reconnect failed", "error", err)

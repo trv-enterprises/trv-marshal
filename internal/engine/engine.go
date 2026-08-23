@@ -24,6 +24,16 @@ const (
 	// to stay out of the way in normal operation, short enough that a stall is
 	// obvious within a few minutes rather than hours.
 	heartbeatInterval = 5 * time.Minute
+
+	// stallTimeout is how long the engine tolerates a nominally-connected
+	// client delivering nothing before it forces a reconnect.
+	//
+	// This is a liveness backstop, not a traffic expectation: the trigger is
+	// silence on a connection paho believes is up, which is the signature of a
+	// half-open socket the broker has already discarded. Zigbee devices here
+	// report at least on a periodic heartbeat, so 20 minutes of total silence
+	// across every subscribed topic is a fault rather than a quiet house.
+	stallTimeout = 20 * time.Minute
 )
 
 // Engine is the core alert processing engine.
@@ -372,18 +382,25 @@ func (e *Engine) heartbeatLoop() {
 				ageSec = time.Since(lastMsgAt).Seconds()
 			}
 
+			// IsConnected() reports paho's *intent* to hold a session, not
+			// the health of the socket. With auto-reconnect enabled it keeps
+			// returning true while the reconnect machinery believes it owns a
+			// connection -- so a client evicted by the broker reports healthy
+			// indefinitely. Treat prolonged silence as the real signal.
 			connected := e.client.IsConnected()
+			stalled := connected && !lastMsgAt.IsZero() && time.Since(lastMsgAt) > stallTimeout
 
 			level := slog.LevelInfo
 			// No messages in a whole interval is not automatically wrong --
 			// a quiet house is quiet -- but combined with a lost connection
 			// it is worth surfacing louder.
-			if !connected {
+			if !connected || stalled {
 				level = slog.LevelError
 			}
 
 			slog.Log(context.Background(), level, "heartbeat",
 				"connected", connected,
+				"stalled", stalled,
 				"messages_total", msgs,
 				"messages_since_last_heartbeat", sinceLast,
 				"last_message_age_sec", ageSec,
@@ -391,8 +408,59 @@ func (e *Engine) heartbeatLoop() {
 				"sweeps_total", sweeps,
 				"uptime_sec", time.Since(startedAt).Seconds(),
 			)
+
+			// Recover the connection by reconnecting from scratch.
+			//
+			// Deliberately NOT client.Disconnect(): paho treats that as a
+			// user-requested shutdown and suppresses auto-reconnect
+			// ("disconnect cleans up after a final disconnection (user
+			// requested so no auto reconnection)", client.go:499), so it
+			// would leave the engine permanently offline rather than
+			// recovered. Disconnect and reconnect explicitly instead, then
+			// resubscribe -- Connect() does not replay subscriptions under
+			// CleanSession, which is the whole reason SubscribeAll exists.
+			if stalled {
+				slog.Error("MQTT stalled: connected but silent, reconnecting",
+					"silent_for_sec", time.Since(lastMsgAt).Seconds(),
+					"threshold_sec", stallTimeout.Seconds(),
+				)
+				e.reconnect()
+			}
 		}
 	}
+}
+
+// reconnect tears down the current MQTT session and establishes a new one.
+//
+// Used by the stall watchdog to recover a half-open socket. The inbound
+// counter is reset first so a reconnect that itself fails silently does not
+// immediately re-trigger the watchdog on the next tick -- lastMsgAt is set to
+// now, giving the fresh connection a full stallTimeout to prove itself.
+func (e *Engine) reconnect() {
+	e.mu.Lock()
+	e.lastMsgAt = time.Now()
+	e.mu.Unlock()
+
+	e.client.Disconnect(250)
+
+	token := e.client.Connect()
+	if !token.WaitTimeout(30 * time.Second) {
+		slog.Error("MQTT reconnect timed out")
+		return
+	}
+	if err := token.Error(); err != nil {
+		slog.Error("MQTT reconnect failed", "error", err)
+		return
+	}
+
+	// Connect() does not restore subscriptions under CleanSession. OnConnect
+	// normally handles this, but call it explicitly so recovery does not
+	// depend on that handler having been wired up.
+	if err := e.SubscribeAll(); err != nil {
+		slog.Error("resubscribe after stall recovery failed", "error", err)
+		return
+	}
+	slog.Info("MQTT reconnected after stall")
 }
 
 // sweepLoop periodically checks all active rule states for threshold crossings.
