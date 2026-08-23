@@ -123,7 +123,7 @@ func TestEnableSwitchClearsOverrideImmediately(t *testing.T) {
 	now := time.Now()
 
 	tr.NoteOverride("r", now)
-	tr.SetEnabled("r", true, 0, now.Add(time.Minute))
+	tr.SetEnabled("r", true, now.Add(time.Minute))
 	if got := tr.Owner("r", ttlMin, now.Add(time.Minute)); got != OwnerAutomation {
 		t.Fatalf("owner = %v, want automation after enable", got)
 	}
@@ -134,7 +134,7 @@ func TestParkedBeatsOverride(t *testing.T) {
 	now := time.Now()
 
 	tr.NoteOverride("r", now)
-	tr.SetEnabled("r", false, 0, now)
+	tr.SetEnabled("r", false, now)
 	if got := tr.Owner("r", ttlMin, now); got != OwnerParked {
 		t.Fatalf("owner = %v, want parked", got)
 	}
@@ -163,7 +163,7 @@ func TestSweepSkipsWhenOwnershipChanged(t *testing.T) {
 
 	eval(tr, true, now, offDelay)
 	eval(tr, false, now.Add(time.Second), offDelay)
-	tr.SetEnabled("r", false, 0, now.Add(2*time.Second)) // park it
+	tr.SetEnabled("r", false, now.Add(2*time.Second)) // park it
 
 	specs := map[string]SweepSpec{"r": {OffTopic: onTopic, OffPayload: offPayl, TTLMinutes: ttlMin}}
 	if due := tr.Sweep(specs, now.Add(time.Duration(offDelay+5)*time.Second)); len(due) != 0 {
@@ -192,64 +192,61 @@ func TestRemoveRuleDropsState(t *testing.T) {
 	}
 }
 
-// The condition can fall while a rule is overridden, leaving no edge to act on
-// once control returns. Resuming must reconcile with the current condition
-// instead of waiting for the next motion cycle -- otherwise the light stays on
-// indefinitely, which is what "toggled Auto back on and nothing happened"
-// looked like in the field on 2026-08-23.
-func TestResumeAfterOverrideSchedulesOffWhenConditionAlreadyFell(t *testing.T) {
+// Resuming automation must not command the light. The real use is cutting an
+// override short after turning the light off by hand on the way out of a room
+// -- "let motion have it again". The tracker cannot see the device state, so
+// any off scheduled here is a guess; the wrong guess darkens a room someone
+// just walked into. Resume restores control and waits for the next edge.
+func TestResumeAfterOverrideSchedulesNothing(t *testing.T) {
 	tr := NewTracker()
 	now := time.Now()
 
-	// Motion turns the light on.
-	if cmds := eval(tr, true, now, offDelay); len(cmds) != 1 {
-		t.Fatalf("expected on-command, got %+v", cmds)
-	}
+	eval(tr, true, now, offDelay) // motion turns it on
+	tr.NoteOverride("r", now.Add(time.Second))
+	// Human turns the light off by hand, then occupancy lapses.
+	eval(tr, false, now.Add(2*time.Second), offDelay)
 
-	// A manual command takes control.
-	if !tr.NoteOverride("r", now.Add(time.Second)) {
-		t.Fatal("expected manual command to engage the override")
-	}
-
-	// Occupancy falls while overridden: tracked, but no command and no timer.
-	if cmds := eval(tr, false, now.Add(2*time.Second), offDelay); cmds != nil {
-		t.Fatalf("expected no command while overridden, got %+v", cmds)
-	}
-
-	// Hand control back.
 	resume := now.Add(3 * time.Second)
-	tr.SetEnabled("r", true, offDelay, resume)
+	tr.SetEnabled("r", true, resume)
 
 	if got := tr.Owner("r", ttlMin, resume); got != OwnerAutomation {
 		t.Fatalf("expected automation to own the rule, got %v", got)
 	}
 
 	specs := map[string]SweepSpec{"r": {OffTopic: onTopic, OffPayload: offPayl, TTLMinutes: ttlMin}}
-
-	// Not yet due.
-	if due := tr.Sweep(specs, resume.Add(time.Duration(offDelay-5)*time.Second)); len(due) != 0 {
-		t.Fatalf("off fired early: %+v", due)
-	}
-
-	// Due after the configured delay, measured from the resume.
-	due := tr.Sweep(specs, resume.Add(time.Duration(offDelay+5)*time.Second))
-	if len(due) != 1 || due[0].Command.Payload != offPayl {
-		t.Fatalf("expected the deferred off to fire after resume, got %+v", due)
+	if due := tr.Sweep(specs, resume.Add(time.Duration(offDelay+60)*time.Second)); len(due) != 0 {
+		t.Fatalf("resume must not schedule an off, got %+v", due)
 	}
 }
 
-// Resuming a rule whose condition is still true must NOT schedule an off --
-// the light should stay on while motion continues.
-func TestResumeWithConditionStillTrueDoesNotScheduleOff(t *testing.T) {
+// After resuming, the next motion cycle must work normally -- on at the rising
+// edge, off once the delay elapses. This is what makes the Auto toggle useful
+// as a "give motion control back now" button.
+func TestMotionWorksNormallyAfterResume(t *testing.T) {
 	tr := NewTracker()
 	now := time.Now()
 
 	eval(tr, true, now, offDelay)
 	tr.NoteOverride("r", now.Add(time.Second))
-	tr.SetEnabled("r", true, offDelay, now.Add(2*time.Second))
+	eval(tr, false, now.Add(2*time.Second), offDelay)
+
+	resume := now.Add(3 * time.Second)
+	tr.SetEnabled("r", true, resume)
+
+	// Fresh motion after the resume.
+	on := resume.Add(time.Second)
+	if cmds := eval(tr, true, on, offDelay); len(cmds) != 1 || cmds[0].Payload != onPayl {
+		t.Fatalf("expected on-command after resume, got %+v", cmds)
+	}
+
+	off := on.Add(time.Second)
+	if cmds := eval(tr, false, off, offDelay); cmds != nil {
+		t.Fatalf("off should be deferred, got %+v", cmds)
+	}
 
 	specs := map[string]SweepSpec{"r": {OffTopic: onTopic, OffPayload: offPayl, TTLMinutes: ttlMin}}
-	if due := tr.Sweep(specs, now.Add(time.Duration(offDelay+30)*time.Second)); len(due) != 0 {
-		t.Fatalf("expected no off while the condition holds, got %+v", due)
+	due := tr.Sweep(specs, off.Add(time.Duration(offDelay+5)*time.Second))
+	if len(due) != 1 || due[0].Command.Payload != offPayl {
+		t.Fatalf("expected the deferred off to fire, got %+v", due)
 	}
 }
