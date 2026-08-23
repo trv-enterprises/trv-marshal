@@ -43,8 +43,21 @@ func main() {
 
 	// Start engine
 	eng := engine.New(cfg, client, *configPath)
-	// Now that the engine exists, let reconnects drive its resubscribe.
+
+	// Arm the reconnect hook, then subscribe once for the connection that is
+	// already up.
+	//
+	// Ordering matters: connectMQTT blocks until connected, so OnConnect has
+	// already fired by now -- and it fired with a nil callback, subscribing
+	// nothing. This call covers that first connection; OnConnect covers every
+	// one after it. Exactly one of the two subscribes per connect, which is
+	// what keeps a single handler registered per topic.
 	hook.set(eng.SubscribeAll)
+	if err := eng.SubscribeAll(); err != nil {
+		slog.Error("initial subscribe failed", "error", err)
+		os.Exit(1)
+	}
+
 	if err := eng.Start(); err != nil {
 		slog.Error("failed to start engine", "error", err)
 		os.Exit(1)

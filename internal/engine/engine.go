@@ -90,11 +90,14 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 }
 
 // Start subscribes to MQTT topics and begins the sweep ticker.
+// Start begins the sweep and heartbeat loops.
+//
+// Deliberately does NOT subscribe: the OnConnect handler already calls
+// SubscribeAll on every connect, the initial one included. Subscribing here
+// too registered a second handler for every topic -- harmless-looking in the
+// logs (each topic "subscribed" twice) but it meant every inbound message was
+// processed twice, so an edge-triggered action published its command twice.
 func (e *Engine) Start() error {
-	if err := e.SubscribeAll(); err != nil {
-		return err
-	}
-
 	go e.sweepLoop()
 	go e.heartbeatLoop()
 	return nil
