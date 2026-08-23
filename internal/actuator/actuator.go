@@ -227,14 +227,33 @@ func (t *Tracker) NoteSelfCommand(rule string) {
 
 // SetEnabled parks or resumes automation for a rule. Resuming also clears any
 // active override, so the enable switch is a single "give control back now".
-func (t *Tracker) SetEnabled(rule string, enabled bool, now time.Time) {
+//
+// Resuming reconciles with the current condition rather than waiting for the
+// next edge. Commands are edge-triggered, so a condition that fell while the
+// rule was overridden or parked leaves no edge to act on once control returns:
+// Evaluate already recorded conditionMet=false and cleared the pending off, so
+// the engine sits with the light on until the *next* motion cycle. That is the
+// "toggled Auto back on and nothing happened" case -- control was restored
+// correctly, but the falling edge had already been consumed.
+//
+// offDelaySeconds is the rule's configured delay; pass 0 for rules without
+// one, in which case a due off is scheduled immediately.
+func (t *Tracker) SetEnabled(rule string, enabled bool, offDelaySeconds int, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	s := t.getOrCreate(rule)
+	wasBlocked := s.parked || !s.overrideAt.IsZero()
 	s.parked = !enabled
 	s.selfEcho = 0
 	if enabled {
 		s.overrideAt = time.Time{}
+		// The light may be on with the condition already false. NoteOverride
+		// clears commandedOn, so trust the condition rather than that flag:
+		// if the rule is resting false, make sure an off is on its way.
+		if wasBlocked && !s.conditionMet && s.offDueAt.IsZero() {
+			s.commandedOn = true
+			s.offDueAt = now.Add(time.Duration(offDelaySeconds) * time.Second)
+		}
 	} else {
 		s.offDueAt = time.Time{}
 	}

@@ -52,7 +52,7 @@ func TestEnableClearsPendingEchoes(t *testing.T) {
 	now := time.Now()
 
 	tr.NoteSelfCommand("r")
-	tr.SetEnabled("r", true, now)
+	tr.SetEnabled("r", true, 0, now)
 
 	if manual := tr.NoteOverride("r", now.Add(time.Second)); !manual {
 		t.Fatal("stale echo credit swallowed a real override after resume")

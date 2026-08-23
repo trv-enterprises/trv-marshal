@@ -278,7 +278,7 @@ func (e *Engine) handleControl(topic string, payload []byte, now time.Time) {
 			slog.Warn("unparseable enable payload", "rule", rule.Name, "payload", string(payload))
 			continue
 		}
-		e.actuators.SetEnabled(rule.Name, enabled, now)
+		e.actuators.SetEnabled(rule.Name, enabled, rule.Action.OffDelaySeconds, now)
 		slog.Info("automation enable changed", "rule", rule.Name, "enabled", enabled)
 		e.publishOwnerState(rule, now)
 	}
