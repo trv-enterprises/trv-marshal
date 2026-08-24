@@ -74,9 +74,29 @@ devices are known to be publishing is a stall, and `last_message_age_sec` says
 how long it has been going on. `-1` means no message has *ever* arrived, which
 usually means subscriptions did not survive a reconnect.
 
-A container `restart: unless-stopped` does not help here: the process never
-exits, it just goes deaf. A healthcheck keyed on the heartbeat's `connected`
-field is what turns this into an automatic restart.
+### Health file and the container healthcheck
+
+`restart: unless-stopped` cannot help when a service fails without exiting —
+the process stays up and the container reports healthy while the client is
+deaf. So every heartbeat also writes its verdict to `/tmp/alert-engine-health`
+(`ok` / `unhealthy`, write-then-rename so a reader never sees a partial write),
+and the compose healthcheck reads it.
+
+**The check requires both recent contents and a recent mtime.** Contents alone
+would report the last verdict forever if the heartbeat goroutine died; mtime
+alone would miss a client that is up but receiving nothing. `Start()` seeds the
+file so a normal boot is not read as a fault.
+
+Docker only *marks* a container unhealthy — it never restarts one. The
+`autoheal` service in the services stack does that, scoped to containers
+labelled `autoheal=true`, so a healthcheck added elsewhere in that stack stays
+informational until it opts in.
+
+Timing is deliberately forgiving: the engine recovers on its own now, so the
+check tolerates roughly six minutes of sustained unhealth before a restart.
+That is long enough for self-recovery to win and short enough that a genuine
+wedge does not last the night. Tighten it and you will restart containers that
+were about to fix themselves.
 
 ## Ownership arbitration (actuation)
 

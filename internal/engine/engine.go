@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,14 @@ const (
 	// overlapping the following one.
 	connectWait = 30 * time.Second
 )
+
+// healthPath is where each heartbeat records its verdict for the
+// container healthcheck to read. Under /tmp because it is genuinely
+// ephemeral: it is rewritten every heartbeat and means nothing across a
+// restart. Nothing outside the container reads it, so it is not a bind mount.
+//
+// A var rather than a const solely so tests can redirect it to a temp dir.
+var healthPath = "/tmp/alert-engine-health"
 
 // Engine is the core alert processing engine.
 type Engine struct {
@@ -117,6 +126,13 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 // logs (each topic "subscribed" twice) but it meant every inbound message was
 // processed twice, so an edge-triggered action published its command twice.
 func (e *Engine) Start() error {
+	// Seed the health file before the first heartbeat. Start is only reached
+	// once the initial connect and subscribe have both succeeded, so "ok" is
+	// accurate here -- and without it the container would read as unhealthy
+	// for the whole first heartbeatInterval, which is a normal boot rather
+	// than a fault.
+	e.writeHealth(true)
+
 	go e.sweepLoop()
 	go e.heartbeatLoop()
 	return nil
@@ -431,6 +447,15 @@ func (e *Engine) heartbeatLoop() {
 				"uptime_sec", time.Since(startedAt).Seconds(),
 			)
 
+			// Publish the same verdict to disk for the container healthcheck.
+			//
+			// Written on every heartbeat, healthy or not: the file's mtime is
+			// what proves the heartbeat loop is still running at all. A
+			// process wedged somewhere else entirely would leave a stale
+			// "healthy" file, and a check that only read the contents would
+			// believe it.
+			e.writeHealth(connected && !stalled)
+
 			// Recover whenever the client is not usable, not only when it is
 			// stalled.
 			//
@@ -511,6 +536,36 @@ func (e *Engine) reconnect() {
 		return
 	}
 	slog.Info("MQTT recovered")
+}
+
+// writeHealth records the latest heartbeat verdict where the container
+// healthcheck can read it.
+//
+// The file carries "ok" or "unhealthy", and its mtime carries the liveness of
+// the heartbeat loop itself. The healthcheck requires both: recent content AND
+// a recent write. Content alone would keep reporting the last verdict forever
+// if this goroutine died; mtime alone would not notice a client that is up but
+// deaf.
+//
+// Written unconditionally, and a write failure is logged but never fatal --
+// losing the health file must not take down a service that is otherwise
+// working. A missing file reads as unhealthy at the healthcheck, which is the
+// safe direction.
+func (e *Engine) writeHealth(ok bool) {
+	status := "unhealthy"
+	if ok {
+		status = "ok"
+	}
+
+	// Write-then-rename so the healthcheck never observes a partial write.
+	tmp := healthPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(status+"\n"), 0o644); err != nil {
+		slog.Warn("could not write health file", "path", tmp, "error", err)
+		return
+	}
+	if err := os.Rename(tmp, healthPath); err != nil {
+		slog.Warn("could not update health file", "path", healthPath, "error", err)
+	}
 }
 
 // waitForDisconnect blocks until the client has fully torn down, returning

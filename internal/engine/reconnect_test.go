@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -233,4 +234,53 @@ func TestReconnectReportsResubscribeFailure(t *testing.T) {
 	if !c.isOpen() {
 		t.Fatal("client should still be connected after a resubscribe failure")
 	}
+}
+
+// The health file is what the container healthcheck reads, so its contents
+// must track the heartbeat's verdict exactly -- an "ok" written while the
+// engine is deaf would defeat the whole mechanism.
+func TestWriteHealthReflectsVerdict(t *testing.T) {
+	dir := t.TempDir()
+	orig := healthPath
+	healthPath = dir + "/health"
+	defer func() { healthPath = orig }()
+
+	e := newTestEngine(&fakeClient{open: true})
+
+	e.writeHealth(true)
+	if got := readFile(t, healthPath); got != "ok\n" {
+		t.Fatalf("healthy verdict wrote %q, want %q", got, "ok\n")
+	}
+
+	e.writeHealth(false)
+	if got := readFile(t, healthPath); got != "unhealthy\n" {
+		t.Fatalf("unhealthy verdict wrote %q, want %q", got, "unhealthy\n")
+	}
+
+	// No leftover temp file: the healthcheck globs nothing, but a stray
+	// .tmp would mean the rename did not happen.
+	if _, err := os.Stat(healthPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temp file left behind; write-then-rename did not complete")
+	}
+}
+
+// A health file that cannot be written must not take down an otherwise
+// working engine -- the healthcheck reads a missing file as unhealthy, which
+// is the safe direction, but the process must survive.
+func TestWriteHealthSurvivesUnwritablePath(t *testing.T) {
+	orig := healthPath
+	healthPath = "/nonexistent-dir-that-should-not-exist/health"
+	defer func() { healthPath = orig }()
+
+	e := newTestEngine(&fakeClient{open: true})
+	e.writeHealth(true) // must not panic
+}
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("reading %s: %v", p, err)
+	}
+	return string(b)
 }
