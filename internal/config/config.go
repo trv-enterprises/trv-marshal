@@ -74,10 +74,10 @@ type ActionSpec struct {
 	// rule yields control for OverrideTTLMinutes, after which automation
 	// resumes. Publishing "false"/"OFF" to EnableTopic parks the rule
 	// indefinitely; "true"/"ON" clears both the park and any active override.
-	OverrideTopic     string `yaml:"override_topic"`
-	OverrideTTLMinutes int   `yaml:"override_ttl_minutes"`
-	EnableTopic       string `yaml:"enable_topic"`
-	StateTopic        string `yaml:"state_topic"`
+	OverrideTopic      string `yaml:"override_topic"`
+	OverrideTTLMinutes int    `yaml:"override_ttl_minutes"`
+	EnableTopic        string `yaml:"enable_topic"`
+	StateTopic         string `yaml:"state_topic"`
 }
 
 // Condition defines the field comparison for a rule.

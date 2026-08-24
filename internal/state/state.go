@@ -10,9 +10,9 @@ type Action int
 
 const (
 	ActionNone    Action = iota // No alert action needed
-	ActionAlert                // Fire new alert
-	ActionRepeat               // Fire repeat alert
-	ActionResolve              // Fire resolve notification
+	ActionAlert                 // Fire new alert
+	ActionRepeat                // Fire repeat alert
+	ActionResolve               // Fire resolve notification
 )
 
 // RuleState tracks the alert state for a single rule.

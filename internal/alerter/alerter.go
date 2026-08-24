@@ -10,8 +10,8 @@ import (
 
 // Alert represents an alert event published to MQTT.
 type Alert struct {
-	Type      string `json:"type"`      // "new", "repeat", or "resolved"
-	Source    string `json:"source"`    // always "alert_engine"
+	Type      string `json:"type"`   // "new", "repeat", or "resolved"
+	Source    string `json:"source"` // always "alert_engine"
 	Severity  string `json:"severity"`
 	Rule      string `json:"rule"`
 	Message   string `json:"message"`

@@ -34,6 +34,25 @@ const (
 	// report at least on a periodic heartbeat, so 20 minutes of total silence
 	// across every subscribed topic is a fault rather than a quiet house.
 	stallTimeout = 20 * time.Minute
+
+	// Recovery timings. Every one of these is a bound on a paho call that can
+	// otherwise block or silently no-op; none may be zero.
+	//
+	// disconnectQuiesceMS is how long Disconnect() waits for in-flight work.
+	// Short on purpose: this path runs because the connection is already
+	// believed dead, so there is nothing worth draining.
+	disconnectQuiesceMS = 250
+
+	// disconnectWait bounds how long we wait for the status to reach
+	// `disconnected` after Disconnect() returns. Disconnect does its work in a
+	// goroutine, so this gap is normal rather than exceptional.
+	disconnectWait = 10 * time.Second
+	disconnectPoll = 50 * time.Millisecond
+
+	// connectWait bounds the reconnect itself. Shorter than heartbeatInterval
+	// so a failed attempt is reported and retried on the next tick rather than
+	// overlapping the following one.
+	connectWait = 30 * time.Second
 )
 
 // Engine is the core alert processing engine.
@@ -412,19 +431,20 @@ func (e *Engine) heartbeatLoop() {
 				"uptime_sec", time.Since(startedAt).Seconds(),
 			)
 
-			// Recover the connection by reconnecting from scratch.
+			// Recover whenever the client is not usable, not only when it is
+			// stalled.
 			//
-			// Deliberately NOT client.Disconnect(): paho treats that as a
-			// user-requested shutdown and suppresses auto-reconnect
-			// ("disconnect cleans up after a final disconnection (user
-			// requested so no auto reconnection)", client.go:499), so it
-			// would leave the engine permanently offline rather than
-			// recovered. Disconnect and reconnect explicitly instead, then
-			// resubscribe -- Connect() does not replay subscriptions under
-			// CleanSession, which is the whole reason SubscribeAll exists.
-			if stalled {
-				slog.Error("MQTT stalled: connected but silent, reconnecting",
-					"silent_for_sec", time.Since(lastMsgAt).Seconds(),
+			// Gating this on `stalled` alone is unrecoverable by
+			// construction: `stalled` requires connected == true, so the
+			// moment a recovery attempt leaves the client disconnected there
+			// is no condition left that can ever fire again. That is exactly
+			// how the engine sat offline for fourteen hours on 2026-08-23,
+			// logging an ERROR heartbeat every five minutes with nothing
+			// acting on it.
+			if stalled || !connected {
+				slog.Error("MQTT unhealthy, reconnecting",
+					"reason", map[bool]string{true: "stalled", false: "disconnected"}[stalled],
+					"silent_for_sec", ageSec,
 					"threshold_sec", stallTimeout.Seconds(),
 				)
 				e.reconnect()
@@ -444,15 +464,39 @@ func (e *Engine) reconnect() {
 	e.lastMsgAt = time.Now()
 	e.mu.Unlock()
 
-	e.client.Disconnect(250)
+	// Disconnect() is the only teardown paho exposes, and it is a blunt one:
+	// it marks the session user-requested, which permanently suppresses
+	// auto-reconnect ("disconnect cleans up after a final disconnection (user
+	// requested so no auto reconnection)", client.go:498). Everything after
+	// this point is therefore our responsibility -- paho will not retry on its
+	// own, so this function must not return without either a live connection
+	// or a client left in a state a later attempt can recover from.
+	e.client.Disconnect(disconnectQuiesceMS)
+
+	// Wait for the teardown to actually land before reconnecting.
+	//
+	// Disconnect() does its work in a goroutine and returns once the quiesce
+	// timer expires, so it routinely returns while the status is still
+	// `disconnecting`. Connect() rejects that with "status can only transition
+	// to connecting from disconnected" (status.go:104) and returns an already-
+	// failed token -- which is precisely how the old code wedged the engine
+	// offline: it treated that rejection as terminal and never retried, and
+	// the watchdog could not fire again because the client was no longer
+	// "connected".
+	if !e.waitForDisconnect(disconnectWait) {
+		slog.Error("MQTT disconnect did not settle, will retry on next heartbeat",
+			"waited_sec", disconnectWait.Seconds())
+		return
+	}
 
 	token := e.client.Connect()
-	if !token.WaitTimeout(30 * time.Second) {
-		slog.Error("MQTT reconnect timed out")
+	if !token.WaitTimeout(connectWait) {
+		slog.Error("MQTT reconnect timed out, will retry on next heartbeat",
+			"waited_sec", connectWait.Seconds())
 		return
 	}
 	if err := token.Error(); err != nil {
-		slog.Error("MQTT reconnect failed", "error", err)
+		slog.Error("MQTT reconnect failed, will retry on next heartbeat", "error", err)
 		return
 	}
 
@@ -460,10 +504,32 @@ func (e *Engine) reconnect() {
 	// normally handles this, but call it explicitly so recovery does not
 	// depend on that handler having been wired up.
 	if err := e.SubscribeAll(); err != nil {
-		slog.Error("resubscribe after stall recovery failed", "error", err)
+		// Connected but deaf -- the same silent failure the heartbeat exists
+		// to catch. Left as-is deliberately: the next heartbeat sees no
+		// inbound messages and drives another recovery.
+		slog.Error("resubscribe after recovery failed, will retry on next heartbeat", "error", err)
 		return
 	}
-	slog.Info("MQTT reconnected after stall")
+	slog.Info("MQTT recovered")
+}
+
+// waitForDisconnect blocks until the client has fully torn down, returning
+// false if it has not settled within timeout.
+//
+// IsConnectionOpen() is the right probe here: it reports the `connected`
+// status specifically, where IsConnected() also reports true while paho is
+// merely *intending* to hold a session (connecting, reconnecting, or
+// disconnecting-with-retry). Waiting on IsConnected() would return the moment
+// the status left `connected`, which is the race this exists to close.
+func (e *Engine) waitForDisconnect(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !e.client.IsConnectionOpen() && !e.client.IsConnected() {
+			return true
+		}
+		time.Sleep(disconnectPoll)
+	}
+	return !e.client.IsConnectionOpen() && !e.client.IsConnected()
 }
 
 // sweepLoop periodically checks all active rule states for threshold crossings.
