@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/trv-homelab/sensor-alert-engine/internal/config"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/config"
 )
 
 // Evaluate checks whether a JSON payload satisfies a rule's condition.

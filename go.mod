@@ -1,4 +1,4 @@
-module github.com/trv-homelab/sensor-alert-engine
+module github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine
 
 go 1.23
 

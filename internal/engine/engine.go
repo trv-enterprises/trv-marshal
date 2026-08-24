@@ -10,11 +10,11 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/trv-homelab/sensor-alert-engine/internal/actuator"
-	"github.com/trv-homelab/sensor-alert-engine/internal/alerter"
-	"github.com/trv-homelab/sensor-alert-engine/internal/config"
-	"github.com/trv-homelab/sensor-alert-engine/internal/evaluator"
-	"github.com/trv-homelab/sensor-alert-engine/internal/state"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/actuator"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/alerter"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/config"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/evaluator"
+	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/state"
 )
 
 const (

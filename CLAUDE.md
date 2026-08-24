@@ -31,9 +31,11 @@ Conflating the two is the most likely way to break this service.
 | `internal/actuator/` | Edge-triggered commands + ownership arbitration |
 | `internal/engine/` | Message dispatch, sweep loop, heartbeat, reconnect |
 
-`internal/engine/` is the **only package without tests**, and it holds the
-connection lifecycle — the exact code that has caused every outage so far. Add
-tests here rather than assuming a change is safe.
+`internal/engine/` holds the connection lifecycle — the exact code behind every
+outage so far, and until 2026-08-24 the only package with no tests at all. It
+now has `reconnect_test.go`, whose fake reproduces paho's return-before-settled
+behaviour. Extend it rather than assuming a change to this package is safe;
+coverage here is still the lowest in the module.
 
 ## MQTT reconnect semantics (paho) — read before touching the connection code
 
@@ -98,21 +100,29 @@ Worked example with full reasoning: `docs/nightlight-automation.md`.
 ## Build and release
 
 ```bash
-make test          # fmt + vet + tests with coverage — run before committing
-make build         # linux binary, CGO_ENABLED=0
-make docker-build  # container image
-make help          # all targets
+make test                          # fmt + vet + tests — run before committing
+make build                         # linux binary, CGO_ENABLED=0
+make docker-build                  # container image, local tag only
+make docker-push VERSION=v0.2.0-rc.8   # build + push to GHCR
+make help                          # all targets
 ```
 
-The deployed image is published to GHCR under the `trv-enterprises` org and
-rolled out by the `alert-engine` Ansible role. Pin the tag via
-`ALERT_ENGINE_VERSION` — the compose file previously hardcoded `:latest`, which
-made rollback impossible.
+There is no CI for this repo, so `docker-push` runs on your machine. It pins
+`linux/amd64` deliberately: the build host is arm64 and the services LXC is
+not, and an inherited platform produces an image the target cannot run. Git
+tags carry a leading `v` and image tags do not — pass either, it is stripped.
+
+Then deploy from `homelab-deploy`:
+
+```bash
+make deploy-alert-engine ALERT_ENGINE_VERSION=0.2.0-rc.8
+```
+
+Pin an explicit tag for anything that must be reproducible — the role defaults
+to `latest`, which cannot be rolled back to a known-good build. The registry
+path is duplicated between this Makefile and the role's `vars/main.yml`; change
+both together.
 
 The live ruleset is **not** the `rules.yaml` in this directory. It lives in
 `homelab-deploy/files/alert-engine/rules.yaml`; deploy with
 `make deploy-alert-engine` from there. The local file is an example only.
-
-> `go.mod` declares `github.com/trv-homelab/sensor-alert-engine`, which predates
-> the repo split and does not match this path. Nothing imports it so it is
-> inert — correct it to the path-based form if you touch `go.mod`.
