@@ -10,6 +10,20 @@ REMOTE_BIN := /usr/local/bin/$(BINARY)
 REMOTE_CONFIG := /etc/alert-engine/rules.yaml
 SERVICE := alert-engine.service
 
+# Container image. Must match alert_engine_image in the Ansible role
+# (tools/ansible/roles/alert-engine/vars/main.yml) -- the role resolves the
+# tag from alert_engine_version, so a mismatch here deploys the wrong thing.
+#
+# The deploy target is amd64 (services LXC on Proxmox); this is built
+# explicitly rather than inherited from the build host, which is arm64.
+IMAGE := ghcr.io/trv-enterprises/$(BINARY)
+IMAGE_PLATFORM ?= linux/amd64
+
+# Image tags carry no leading "v" even though git tags do -- GHCR convention.
+# Pass the git tag and it is stripped: VERSION=v0.2.0-rc.8 -> 0.2.0-rc.8
+VERSION ?=
+IMAGE_TAG := $(patsubst v%,%,$(VERSION))
+
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
@@ -48,8 +62,26 @@ build: ## Build linux binary (CGO_ENABLED=0)
 		-o $(BINARY) ./cmd/alert-engine/
 
 .PHONY: docker-build
-docker-build: ## Build Docker image
-	docker build -t $(BINARY):latest .
+docker-build: ## Build Docker image (local tag, no registry)
+	docker build --platform $(IMAGE_PLATFORM) -t $(BINARY):latest .
+
+.PHONY: docker-push
+docker-push: require-version ## Build and push VERSION=x.y.z to GHCR
+	@echo "Building $(IMAGE):$(IMAGE_TAG) for $(IMAGE_PLATFORM)"
+	docker build --platform $(IMAGE_PLATFORM) -t $(IMAGE):$(IMAGE_TAG) .
+	@# Requires a GHCR login with write:packages on the trv-enterprises org:
+	@#   echo $$TRVE_GH_TOKEN | docker login ghcr.io -u <user> --password-stdin
+	docker push $(IMAGE):$(IMAGE_TAG)
+	@echo
+	@echo "Pushed $(IMAGE):$(IMAGE_TAG)"
+	@echo "Deploy with: make deploy-alert-engine ALERT_ENGINE_VERSION=$(IMAGE_TAG)  (from homelab-deploy)"
+
+.PHONY: require-version
+require-version:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "VERSION is required, e.g. make docker-push VERSION=v0.2.0-rc.8"; \
+		exit 1; \
+	fi
 
 ##@ Deploy
 
