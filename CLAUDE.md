@@ -33,14 +33,19 @@ Conflating the two is the most likely way to break this service.
 
 `internal/engine/` holds the connection lifecycle — the exact code behind every
 outage so far, and until 2026-08-24 the only package with no tests at all. It
-now has `reconnect_test.go`, whose fake reproduces paho's return-before-settled
-behaviour. Extend it rather than assuming a change to this package is safe;
-coverage here is still the lowest in the module.
+now has `reconnect_test.go`. Extend it rather than assuming a change here is
+safe — and note the lesson from 2026-08-25: a fake that models the paho
+behaviour you *assume* will happily validate a fix that cannot work. When the
+library's semantics are load-bearing, verify them against a real broker before
+designing around them.
 
 ## MQTT reconnect semantics (paho) — read before touching the connection code
 
-Two multi-hour silent outages (2026-08-22, 2026-08-23) came from this area.
-Both had the same signature: process up, container healthy, zero commands
+Three silent outages (2026-08-22, 2026-08-23, 2026-08-25) came from this area.
+Library-level notes that apply beyond this service live in the global
+`paho-mqtt-go-pitfalls` memory.
+
+All three had the same signature: process up, container healthy, zero commands
 published, because as far as the engine knew nothing had happened. The failure
 is invisible unless you are looking for *absence*.
 
@@ -53,6 +58,12 @@ is invisible unless you are looking for *absence*.
   asynchronously. A `Connect()` immediately after it is rejected with
   `status can only transition to connecting from disconnected` — leaving the
   client offline with no retry scheduled.
+- **A wedged client cannot be reliably rehabilitated.** Neither exported probe
+  distinguishes `disconnecting` from `disconnected`, so waiting for the status
+  to settle is not possible through the public API, and a second `Disconnect()`
+  returns early once already disconnected. **Recovery builds a NEW client**
+  (`SetClientFactory`) — a fresh one starts at `disconnected`, so its
+  `Connect()` is always legal. Adopt it only once connected.
 - **`Connect()` does not replay subscriptions** under CleanSession. Every
   reconnect path must resubscribe explicitly. That is what `SubscribeAll` is
   for, and why `OnConnect` calls it.
@@ -86,6 +97,13 @@ and the compose healthcheck reads it.
 would report the last verdict forever if the heartbeat goroutine died; mtime
 alone would miss a client that is up but receiving nothing. `Start()` seeds the
 file so a normal boot is not read as a fault.
+
+**The health verdict uses `unhealthyTimeout`, not `stalled`.** They answer
+different questions: `stallTimeout` (20m) gates *recovery*, where thrashing is
+worse than waiting, while the health verdict must sour sooner or a deaf engine
+reports healthy right up to the moment it repairs itself. Keying the verdict on
+`stalled` is exactly why a twenty-minute deafness reported `(healthy)`
+throughout on 2026-08-25.
 
 Docker only *marks* a container unhealthy — it never restarts one. The
 `autoheal` service in the services stack does that, scoped to containers

@@ -37,6 +37,10 @@ type fakeClient struct {
 	// connectErr is returned by Connect when non-nil and the client is not
 	// settled -- mirroring errStatusMustBeDisconnected.
 	connectErrWhileSettling error
+
+	// connectFails makes every Connect() fail, modelling a replacement client
+	// that cannot reach the broker.
+	connectFails error
 }
 
 func (f *fakeClient) IsConnectionOpen() bool {
@@ -67,6 +71,9 @@ func (f *fakeClient) Connect() mqtt.Token {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.connectN++
+	if f.connectFails != nil {
+		return &fakeToken{err: f.connectFails}
+	}
 	if f.settling && f.connectErrWhileSettling != nil {
 		return &fakeToken{err: f.connectErrWhileSettling}
 	}
@@ -112,51 +119,69 @@ func newTestEngine(c mqtt.Client) *Engine {
 	return New(&config.Config{AlertTopic: "sensors/alerts"}, c, "")
 }
 
-// The regression test for the outage. paho's Disconnect() hands back control
-// while the status is still `disconnecting`; a Connect() issued in that window
-// is rejected outright. The old code took that rejection as terminal, so the
-// engine stayed offline until someone restarted the container by hand.
-func TestReconnectWaitsOutDisconnectBeforeConnecting(t *testing.T) {
-	c := &fakeClient{
+// The regression test for the outage. A wedged paho client can refuse
+// Connect() with "status can only transition to connecting from disconnected",
+// and no exported method reliably drives it back to a state that accepts one.
+// Recovery must therefore build a REPLACEMENT client, not retry the old one.
+func TestReconnectReplacesTheClientRatherThanRetryingIt(t *testing.T) {
+	wedged := &fakeClient{
 		open:                    true,
-		settleAfter:             3, // a few polls of `disconnecting` first
+		neverSettles:            true, // never returns to a connectable state
 		connectErrWhileSettling: errors.New("status can only transition to connecting from disconnected"),
 	}
-	e := newTestEngine(c)
+	fresh := &fakeClient{}
+
+	e := newTestEngine(wedged)
+	e.SetClientFactory(func() mqtt.Client { return fresh })
 
 	e.reconnect()
 
-	if !c.isOpen() {
-		t.Fatal("engine did not reconnect: client still closed")
+	if got := wedged.connectCount(); got != 0 {
+		t.Fatalf("Connect() called %d times on the wedged client, want 0 -- it can never succeed", got)
 	}
-	if got := c.connectCount(); got != 1 {
-		t.Fatalf("Connect() called %d times, want exactly 1 (a rejected attempt means the wait did not work)", got)
+	if !fresh.isOpen() {
+		t.Fatal("replacement client was not connected")
+	}
+	e.mu.Lock()
+	adopted := e.client == mqtt.Client(fresh)
+	e.mu.Unlock()
+	if !adopted {
+		t.Fatal("engine did not adopt the replacement client")
 	}
 }
 
-// A teardown that never settles must not be treated as a permanent failure.
-// reconnect() returns so the next heartbeat can try again, rather than
-// blocking the heartbeat loop or burning a Connect() that is certain to fail.
-func TestReconnectGivesUpWhenDisconnectNeverSettles(t *testing.T) {
-	t.Parallel() // this one just waits out disconnectWait; don't serialise it
+// A replacement that fails to connect must not be adopted: the engine should
+// keep pointing at something known and try again on the next heartbeat.
+func TestReconnectKeepsOldClientWhenReplacementFails(t *testing.T) {
+	old := &fakeClient{open: true}
+	bad := &fakeClient{connectFails: errors.New("dial tcp: connection refused")}
 
-	c := &fakeClient{open: true, neverSettles: true}
-	e := newTestEngine(c)
+	e := newTestEngine(old)
+	e.SetClientFactory(func() mqtt.Client { return bad })
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		e.reconnect()
-	}()
+	e.reconnect()
 
-	select {
-	case <-done:
-	case <-time.After(disconnectWait + 5*time.Second):
-		t.Fatal("reconnect() blocked past its own timeout")
+	e.mu.Lock()
+	stillOld := e.client == mqtt.Client(old)
+	e.mu.Unlock()
+	if !stillOld {
+		t.Fatal("engine adopted a client that never connected")
 	}
+}
 
-	if got := c.connectCount(); got != 0 {
-		t.Fatalf("Connect() called %d times while still disconnecting, want 0", got)
+// A factory that cannot build a client at all must not panic or adopt nil.
+func TestReconnectSurvivesNilFromFactory(t *testing.T) {
+	old := &fakeClient{open: true}
+	e := newTestEngine(old)
+	e.SetClientFactory(func() mqtt.Client { return nil })
+
+	e.reconnect() // must not panic
+
+	e.mu.Lock()
+	stillOld := e.client == mqtt.Client(old)
+	e.mu.Unlock()
+	if !stillOld {
+		t.Fatal("engine dropped its client for a nil replacement")
 	}
 }
 
@@ -168,7 +193,9 @@ func TestUnhealthyTriggersOnDisconnectedNotOnlyStalled(t *testing.T) {
 	// Disconnected and never stalled: lastMsgAt is recent, so the old
 	// `stalled`-only gate would not have fired at all.
 	c := &fakeClient{open: false, settleAfter: 1}
+	fresh := &fakeClient{}
 	e := newTestEngine(c)
+	e.SetClientFactory(func() mqtt.Client { return fresh })
 
 	e.mu.Lock()
 	e.lastMsgAt = time.Now()
@@ -186,7 +213,7 @@ func TestUnhealthyTriggersOnDisconnectedNotOnlyStalled(t *testing.T) {
 		t.Fatal("recovery condition did not fire for a disconnected client")
 	}
 
-	if !c.isOpen() {
+	if !fresh.isOpen() {
 		t.Fatal("engine did not recover from a plain disconnect")
 	}
 }
@@ -196,6 +223,7 @@ func TestUnhealthyTriggersOnDisconnectedNotOnlyStalled(t *testing.T) {
 func TestReconnectResetsMessageAgeSoRetriesAreSpaced(t *testing.T) {
 	c := &fakeClient{open: true, settleAfter: 1}
 	e := newTestEngine(c)
+	e.SetClientFactory(func() mqtt.Client { return &fakeClient{} })
 
 	e.mu.Lock()
 	e.lastMsgAt = time.Now().Add(-2 * stallTimeout)
@@ -217,7 +245,8 @@ func TestReconnectResetsMessageAgeSoRetriesAreSpaced(t *testing.T) {
 // heartbeat exists to catch.
 func TestReconnectReportsResubscribeFailure(t *testing.T) {
 	c := &fakeClient{open: true, settleAfter: 1}
-	c.subscribe = func() mqtt.Token { return &fakeToken{err: errors.New("subscribe refused")} }
+	fresh := &fakeClient{}
+	fresh.subscribe = func() mqtt.Token { return &fakeToken{err: errors.New("subscribe refused")} }
 
 	cfg := &config.Config{
 		AlertTopic: "sensors/alerts",
@@ -226,12 +255,13 @@ func TestReconnectReportsResubscribeFailure(t *testing.T) {
 		},
 	}
 	e := New(cfg, c, "")
+	e.SetClientFactory(func() mqtt.Client { return fresh })
 
-	// Should not panic and should leave the client connected; the failure is
-	// surfaced through the log, and the next heartbeat retries.
+	// Should not panic. The replacement connects, then resubscribe fails --
+	// the client stays connected but deaf, which the next heartbeat catches.
 	e.reconnect()
 
-	if !c.isOpen() {
+	if !fresh.isOpen() {
 		t.Fatal("client should still be connected after a resubscribe failure")
 	}
 }
@@ -283,4 +313,49 @@ func readFile(t *testing.T, p string) string {
 		t.Fatalf("reading %s: %v", p, err)
 	}
 	return string(b)
+}
+
+// The health verdict must sour well before the recovery threshold. Keying it
+// on `stalled` (20m) is why a twenty-minute deafness reported healthy the whole
+// time on 2026-08-25 -- the container looked fine while receiving nothing.
+func TestHealthThresholdIsTighterThanTheRecoveryThreshold(t *testing.T) {
+	if unhealthyTimeout >= stallTimeout {
+		t.Fatalf("unhealthyTimeout (%s) must be shorter than stallTimeout (%s), "+
+			"otherwise a deaf engine reports healthy right up to the moment it recovers",
+			unhealthyTimeout, stallTimeout)
+	}
+}
+
+// The verdict the heartbeat writes, evaluated exactly as heartbeatLoop does.
+func healthVerdict(connected bool, lastMsgAt, startedAt time.Time) bool {
+	silent := !lastMsgAt.IsZero() && time.Since(lastMsgAt) > unhealthyTimeout
+	neverHeard := lastMsgAt.IsZero() && time.Since(startedAt) > unhealthyTimeout
+	return connected && !silent && !neverHeard
+}
+
+func TestHealthVerdictCases(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name      string
+		connected bool
+		lastMsgAt time.Time
+		startedAt time.Time
+		want      bool
+	}{
+		{"connected and recently heard", true, now.Add(-time.Minute), now.Add(-time.Hour), true},
+		{"disconnected", false, now.Add(-time.Minute), now.Add(-time.Hour), false},
+		{"connected but silent past the threshold", true, now.Add(-unhealthyTimeout - time.Minute), now.Add(-time.Hour), false},
+		{"silent but still inside the threshold", true, now.Add(-unhealthyTimeout + time.Minute), now.Add(-time.Hour), true},
+		// A fresh process that has heard nothing yet is not a fault: a quiet
+		// house is quiet, and failing here would fail its own boot.
+		{"never heard anything, just started", true, time.Time{}, now.Add(-time.Minute), true},
+		{"never heard anything, up a long time", true, time.Time{}, now.Add(-time.Hour), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := healthVerdict(tc.connected, tc.lastMsgAt, tc.startedAt); got != tc.want {
+				t.Fatalf("verdict = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

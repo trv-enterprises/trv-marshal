@@ -44,16 +44,23 @@ const (
 	// believed dead, so there is nothing worth draining.
 	disconnectQuiesceMS = 250
 
-	// disconnectWait bounds how long we wait for the status to reach
-	// `disconnected` after Disconnect() returns. Disconnect does its work in a
-	// goroutine, so this gap is normal rather than exceptional.
-	disconnectWait = 10 * time.Second
-	disconnectPoll = 50 * time.Millisecond
-
 	// connectWait bounds the reconnect itself. Shorter than heartbeatInterval
 	// so a failed attempt is reported and retried on the next tick rather than
 	// overlapping the following one.
 	connectWait = 30 * time.Second
+
+	// unhealthyTimeout is when silence starts being reported as UNHEALTHY to
+	// the container healthcheck. Deliberately shorter than stallTimeout.
+	//
+	// The two thresholds answer different questions. stallTimeout (20m) gates
+	// RECOVERY and is long to avoid thrashing a connection that is merely
+	// quiet. unhealthyTimeout gates the health VERDICT, and 20m is far too
+	// long there: on 2026-08-25 the engine was deaf for twenty minutes while
+	// the container reported healthy the whole time, because the verdict was
+	// keyed on `stalled`. Reporting unhealthy sooner lets recovery attempt the
+	// repair first, and the healthcheck's own retries add further delay before
+	// anything restarts.
+	unhealthyTimeout = 12 * time.Minute
 )
 
 // healthPath is where each heartbeat records its verdict for the
@@ -73,6 +80,22 @@ type Engine struct {
 	alerter    *alerter.Alerter
 	configPath string
 	stopSweep  chan struct{}
+
+	// newClient builds a REPLACEMENT MQTT client during recovery.
+	//
+	// Recovery cannot reuse the existing client. paho's connection status is a
+	// state machine with transitions that reject Connect() outright ("status
+	// can only transition to connecting from disconnected"), and the exported
+	// API gives no reliable way to drive a wedged client back to a state that
+	// accepts one -- IsConnected()/IsConnectionOpen() both read false while the
+	// status is still `disconnecting`, and a second Disconnect() returns early
+	// on an already-disconnected client, leaving exactly the state that
+	// rejects Connect. Verified against paho v1.5.0 with a live broker.
+	//
+	// Building a new client sidesteps the state machine entirely: a fresh
+	// client starts at `disconnected`, so its Connect() is always legal.
+	// nil disables client replacement (tests that inject a fake client).
+	newClient func() mqtt.Client
 
 	// Liveness counters. A stalled engine looks identical to an idle one in
 	// the logs -- the process is up, the container is healthy, and nothing is
@@ -115,6 +138,23 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 		stopSweep:  make(chan struct{}),
 		startedAt:  time.Now(),
 	}
+}
+
+// SetClientFactory supplies the constructor used to build a replacement MQTT
+// client during recovery. Without it, recovery can only retry the existing
+// client, which a wedged paho state machine may refuse forever.
+func (e *Engine) SetClientFactory(f func() mqtt.Client) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.newClient = f
+}
+
+// swapClient installs a replacement client and points the publisher at it.
+func (e *Engine) swapClient(c mqtt.Client) {
+	e.mu.Lock()
+	e.client = c
+	e.mu.Unlock()
+	e.alerter.SetPublisher(&mqttPublisher{client: c})
 }
 
 // Start subscribes to MQTT topics and begins the sweep ticker.
@@ -454,7 +494,21 @@ func (e *Engine) heartbeatLoop() {
 			// process wedged somewhere else entirely would leave a stale
 			// "healthy" file, and a check that only read the contents would
 			// believe it.
-			e.writeHealth(connected && !stalled)
+			// Health verdict, deliberately NOT the same test as recovery.
+			//
+			// `stalled` is keyed on stallTimeout (20m) because that gates
+			// reconnection, where thrashing is worse than waiting. The health
+			// verdict needs to sour sooner: a client that has heard nothing
+			// for unhealthyTimeout is not healthy, whatever paho's connection
+			// status claims. Keying this on `stalled` is why a twenty-minute
+			// deafness reported healthy throughout on 2026-08-25.
+			//
+			// lastMsgAt.IsZero() means nothing has EVER arrived; that is only
+			// unhealthy once the process has been up long enough to expect
+			// something, otherwise a quiet start would fail its own boot.
+			silent := !lastMsgAt.IsZero() && time.Since(lastMsgAt) > unhealthyTimeout
+			neverHeard := lastMsgAt.IsZero() && time.Since(startedAt) > unhealthyTimeout
+			e.writeHealth(connected && !silent && !neverHeard)
 
 			// Recover whenever the client is not usable, not only when it is
 			// stalled.
@@ -487,34 +541,37 @@ func (e *Engine) heartbeatLoop() {
 func (e *Engine) reconnect() {
 	e.mu.Lock()
 	e.lastMsgAt = time.Now()
+	factory := e.newClient
+	old := e.client
 	e.mu.Unlock()
 
-	// Disconnect() is the only teardown paho exposes, and it is a blunt one:
-	// it marks the session user-requested, which permanently suppresses
-	// auto-reconnect ("disconnect cleans up after a final disconnection (user
-	// requested so no auto reconnection)", client.go:498). Everything after
-	// this point is therefore our responsibility -- paho will not retry on its
-	// own, so this function must not return without either a live connection
-	// or a client left in a state a later attempt can recover from.
-	e.client.Disconnect(disconnectQuiesceMS)
+	// Tear the old client down best-effort. Its state afterwards does not
+	// matter, because it is being discarded -- which is the point. Reusing it
+	// is what failed in production: Disconnect() returns while the status is
+	// still `disconnecting`, and Connect() rejects that with "status can only
+	// transition to connecting from disconnected". Both exported probes read
+	// false during that window, so there is no reliable way to wait it out.
+	old.Disconnect(disconnectQuiesceMS)
 
-	// Wait for the teardown to actually land before reconnecting.
-	//
-	// Disconnect() does its work in a goroutine and returns once the quiesce
-	// timer expires, so it routinely returns while the status is still
-	// `disconnecting`. Connect() rejects that with "status can only transition
-	// to connecting from disconnected" (status.go:104) and returns an already-
-	// failed token -- which is precisely how the old code wedged the engine
-	// offline: it treated that rejection as terminal and never retried, and
-	// the watchdog could not fire again because the client was no longer
-	// "connected".
-	if !e.waitForDisconnect(disconnectWait) {
-		slog.Error("MQTT disconnect did not settle, will retry on next heartbeat",
-			"waited_sec", disconnectWait.Seconds())
+	if factory == nil {
+		// No factory (tests, or a deliberately fixed client): retry the
+		// existing one. Better than nothing, but subject to the state-machine
+		// rejection described above.
+		e.finishReconnect(old)
 		return
 	}
 
-	token := e.client.Connect()
+	// A fresh client starts at `disconnected`, so its Connect() is always a
+	// legal transition regardless of how wedged the old one was.
+	fresh := factory()
+	if fresh == nil {
+		// The factory already logged why. Returning here leaves the engine on
+		// the old client, which the next heartbeat will try to recover again.
+		slog.Error("no replacement MQTT client, will retry on next heartbeat")
+		return
+	}
+
+	token := fresh.Connect()
 	if !token.WaitTimeout(connectWait) {
 		slog.Error("MQTT reconnect timed out, will retry on next heartbeat",
 			"waited_sec", connectWait.Seconds())
@@ -525,9 +582,30 @@ func (e *Engine) reconnect() {
 		return
 	}
 
-	// Connect() does not restore subscriptions under CleanSession. OnConnect
-	// normally handles this, but call it explicitly so recovery does not
-	// depend on that handler having been wired up.
+	// Only adopt the new client once it is actually connected, so a failed
+	// attempt leaves the engine pointing at something known rather than at a
+	// half-built replacement.
+	e.swapClient(fresh)
+	e.finishReconnect(fresh)
+}
+
+// finishReconnect resubscribes on a freshly connected client.
+//
+// Connect() does not restore subscriptions under CleanSession, so without this
+// the engine reconnects, reports healthy, and silently receives nothing.
+func (e *Engine) finishReconnect(c mqtt.Client) {
+	if !c.IsConnected() {
+		token := c.Connect()
+		if !token.WaitTimeout(connectWait) {
+			slog.Error("MQTT reconnect timed out, will retry on next heartbeat")
+			return
+		}
+		if err := token.Error(); err != nil {
+			slog.Error("MQTT reconnect failed, will retry on next heartbeat", "error", err)
+			return
+		}
+	}
+
 	if err := e.SubscribeAll(); err != nil {
 		// Connected but deaf -- the same silent failure the heartbeat exists
 		// to catch. Left as-is deliberately: the next heartbeat sees no
@@ -566,25 +644,6 @@ func (e *Engine) writeHealth(ok bool) {
 	if err := os.Rename(tmp, healthPath); err != nil {
 		slog.Warn("could not update health file", "path", healthPath, "error", err)
 	}
-}
-
-// waitForDisconnect blocks until the client has fully torn down, returning
-// false if it has not settled within timeout.
-//
-// IsConnectionOpen() is the right probe here: it reports the `connected`
-// status specifically, where IsConnected() also reports true while paho is
-// merely *intending* to hold a session (connecting, reconnecting, or
-// disconnecting-with-retry). Waiting on IsConnected() would return the moment
-// the status left `connected`, which is the race this exists to close.
-func (e *Engine) waitForDisconnect(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !e.client.IsConnectionOpen() && !e.client.IsConnected() {
-			return true
-		}
-		time.Sleep(disconnectPoll)
-	}
-	return !e.client.IsConnectionOpen() && !e.client.IsConnected()
 }
 
 // sweepLoop periodically checks all active rule states for threshold crossings.

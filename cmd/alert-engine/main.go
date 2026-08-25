@@ -52,6 +52,19 @@ func main() {
 	// nothing. This call covers that first connection; OnConnect covers every
 	// one after it. Exactly one of the two subscribes per connect, which is
 	// what keeps a single handler registered per topic.
+	// Recovery builds a REPLACEMENT client rather than reusing this one: a
+	// wedged paho client can refuse Connect() indefinitely, and no exported
+	// method reliably drives it back to a state that accepts one. A fresh
+	// client always starts at `disconnected`, so its Connect() is legal.
+	eng.SetClientFactory(func() mqtt.Client {
+		c, err := connectMQTT(cfg.MQTT, hook)
+		if err != nil {
+			slog.Error("building replacement MQTT client failed", "error", err)
+			return nil
+		}
+		return c
+	})
+
 	hook.set(eng.SubscribeAll)
 	if err := eng.SubscribeAll(); err != nil {
 		slog.Error("initial subscribe failed", "error", err)

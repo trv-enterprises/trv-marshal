@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,8 +27,27 @@ type Publisher interface {
 
 // Alerter builds and publishes alert events.
 type Alerter struct {
+	// Guarded because recovery can replace the publisher (the MQTT client is
+	// rebuilt rather than reused) while the sweep goroutine is publishing
+	// through it.
+	mu         sync.RWMutex
 	publisher  Publisher
 	alertTopic string
+}
+
+// SetPublisher swaps the underlying publisher, for when the MQTT client is
+// replaced during connection recovery.
+func (a *Alerter) SetPublisher(p Publisher) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.publisher = p
+}
+
+// pub returns the current publisher under the read lock.
+func (a *Alerter) pub() Publisher {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.publisher
 }
 
 // New creates a new Alerter.
@@ -62,7 +82,7 @@ func (a *Alerter) SendAlert(alertType, severity, ruleName, message, device strin
 		"device", device,
 	)
 
-	return a.publisher.Publish(a.alertTopic, payload)
+	return a.pub().Publish(a.alertTopic, payload)
 }
 
 // RenderMessage replaces template variables in a message string.
