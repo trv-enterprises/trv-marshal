@@ -1,14 +1,14 @@
 module github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine
 
-go 1.23
+go 1.25.14
 
 require (
-	github.com/eclipse/paho.mqtt.golang v1.5.0
+	github.com/eclipse/paho.mqtt.golang v1.5.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/gorilla/websocket v1.5.3 // indirect
-	golang.org/x/net v0.27.0 // indirect
-	golang.org/x/sync v0.7.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 )
