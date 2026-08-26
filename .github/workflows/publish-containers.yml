@@ -1,0 +1,131 @@
+name: Publish Container
+
+# Builds and pushes the Marshal image to GHCR on a version tag.
+#
+# Plain `v*` tags here, unlike trv-homelab: that repo is a monorepo where a
+# bare tag could not say which of two images it meant, so it needs a
+# `<service>/v*` prefix. This repo has exactly one image, so the prefix would
+# be noise.
+#
+#   git tag -a v0.2.1 -m "..." && git push origin v0.2.1
+#   -> ghcr.io/trv-enterprises/marshal:0.2.1
+#
+# The image tag drops the leading v, matching GHCR convention and what the
+# Ansible role resolves from marshal_version.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. 0.2.1). Defaults to the branch name.'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: marshal
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Do not publish an image whose own tests do not pass. The build below is a
+  # separate `docker build` and would happily produce a green image from a
+  # broken tree otherwise.
+  test:
+    name: Test before publishing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+  build-and-push:
+    name: Build and push
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU so one runner emits both architectures. The homelab target is
+      # amd64 (services LXC); arm64 costs little and removes the "built on an
+      # arm64 laptop, deployed to amd64" trap entirely.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No `latest` on a prerelease. A hyphen means prerelease under semver,
+      # and the deploy role defaults to :latest — so moving latest to an rc
+      # would silently roll one out to any host that had not pinned a version.
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            version="${{ inputs.tag }}"
+          fi
+          tags="${image}:${version}"
+          case "$version" in
+            *-*) echo "Prerelease ($version) — not moving :latest." ;;
+            *)   tags="${tags},${image}:latest" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Tags: $tags"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # image.source is what links the GHCR package back to this repo.
+          # Without it a package is created orphaned, and Actions is then
+          # denied write_package until someone grants access by hand in
+          # Package settings -> Manage Actions access.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Published Marshal \`${{ steps.tags.outputs.version }}\`"
+            echo
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo
+            echo "Deploy from \`homelab-deploy\`:"
+            echo
+            echo '```'
+            echo "make deploy-marshal MARSHAL_VERSION=${{ steps.tags.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

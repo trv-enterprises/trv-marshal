@@ -9,7 +9,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/config"
+	"github.com/trv-enterprises/trv-marshal/internal/config"
 )
 
 // fakeClient models the parts of paho's Client that the recovery path touches,

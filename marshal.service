@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/alert-engine -config /etc/alert-engine/rules.yaml
+ExecStart=/usr/local/bin/marshal -config /etc/marshal/rules.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5

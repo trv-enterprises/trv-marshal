@@ -1,0 +1,62 @@
+# yamllint config for CI (see .github/workflows/pr-checks.yml).
+#
+# Deliberately permissive: this exists to catch YAML that is genuinely BROKEN
+# — a bad indent that silently reparents a task, a duplicate key that discards
+# half a role's config, a tab that Ansible refuses to load — not to enforce a
+# house style on 48 files written before any linter existed.
+#
+# A linter that red-lights the entire repo on day one is a linter everyone
+# learns to skip. Everything below that is switched off is off on purpose;
+# turn individual rules back on when the repo is ready to absorb the churn.
+
+extends: default
+
+ignore: |
+  .git/
+
+rules:
+  # Ansible YAML runs long — module args, URLs, Jinja expressions. Wrapping
+  # them hurts readability more than the length does.
+  line-length: disable
+
+  # Playbooks and role files are conventionally indented with a leading "- "
+  # at the same level as the parent key. Enforcing a single style here would
+  # rewrite nearly every file for no functional gain.
+  indentation: disable
+
+  # `on:` in a GitHub Actions workflow is the trigger key, but YAML 1.1 reads
+  # a bare `on` as boolean true. This rule would flag every workflow file.
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+
+  comments-indentation: disable
+
+  # Off because the repo uses extra spaces after commas to COLUMN-ALIGN
+  # inline maps — e.g. the tsstore role's schema tables, where aligning
+  # index/name/type makes a 40-row field list readable at a glance. That is
+  # better formatting than the rule's ideal, not worse. 59 findings, all of
+  # them that pattern.
+  commas: disable
+
+  # A warning, not an error, and only on GitHub workflow files which
+  # conventionally omit the marker. Not worth a repo-wide edit.
+  document-start: disable
+
+  # Some role defaults intentionally end without a trailing newline after a
+  # block scalar; not worth failing a build over.
+  new-line-at-end-of-file: disable
+  empty-lines: disable
+  trailing-spaces: enable
+
+  # These two catch real bugs and stay ON:
+  #   key-duplicates — a repeated key silently discards the earlier value
+  #   syntax errors  — always fatal, not configurable
+  key-duplicates: enable
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: false

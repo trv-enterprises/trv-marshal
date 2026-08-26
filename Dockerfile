@@ -5,11 +5,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o alert-engine ./cmd/alert-engine/
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o marshal ./cmd/marshal/
 
 FROM alpine:3.20
 RUN apk --no-cache add ca-certificates
-COPY --from=builder /app/alert-engine /usr/local/bin/alert-engine
+COPY --from=builder /app/marshal /usr/local/bin/marshal
 
-ENTRYPOINT ["alert-engine"]
-CMD ["-config", "/etc/alert-engine/rules.yaml"]
+ENTRYPOINT ["marshal"]
+CMD ["-config", "/etc/marshal/rules.yaml"]

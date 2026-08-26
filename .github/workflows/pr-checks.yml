@@ -1,0 +1,112 @@
+name: PR Checks
+
+# Validation gates for every pull request into main (and pushes to main as a
+# backstop). Adapted from trv-homelab's, simplified: this is a single Go module
+# at the repo root, so no per-module matrix and no Ansible tree.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race, not a plain `go test`.
+      #
+      # The recovery path swaps the MQTT client and the alerter's publisher out
+      # from under a running sweep goroutine, and several tests exist to be run
+      # under the detector. Without -race they pass while proving nothing about
+      # the thing most likely to break — which is exactly how a broken reconnect
+      # fix shipped on 2026-08-24.
+      - name: go test -race
+        run: go test -race ./...
+
+  gofmt:
+    name: gofmt (changed files)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Scoped to the files this PR touches rather than the whole tree, so a
+      # historical formatting backlog cannot block unrelated work.
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          # xargs -0 passes each filename as its own argument. An unquoted
+          # "$files" string works in bash but collapses to one bogus filename
+          # in zsh, and gofmt then reports nothing — the check would pass
+          # everything. Don't "simplify" this.
+          files="$(git diff --name-only --diff-filter=d "$base"...HEAD -- '*.go')"
+          if [ -z "$files" ]; then
+            echo "No Go files changed."
+            exit 0
+          fi
+          printf 'Checking:\n'; printf '%s\n' "$files" | sed 's/^/  /'
+          unformatted="$(
+            git diff -z --name-only --diff-filter=d "$base"...HEAD -- '*.go' \
+              | xargs -0 gofmt -l
+          )"
+          if [ -n "$unformatted" ]; then
+            echo
+            echo "::error::Changed Go files are not gofmt-formatted"
+            printf '%s\n' "$unformatted" | sed 's/^/  /'
+            echo
+            echo "Fix with:  gofmt -w $(printf '%s ' $unformatted)"
+            echo
+            echo "--- diff ---"
+            printf '%s\n' "$unformatted" | tr '\n' '\0' | xargs -0 gofmt -d
+            exit 1
+          fi
+          echo "All changed Go files are formatted."
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Reachability-based: reports a CVE only when this code actually calls
+      # the affected function. Also covers the Go toolchain, so a stdlib CVE
+      # surfaces here rather than at the next dependency bump — which is how
+      # nine of them were found the first time this ran in trv-homelab.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

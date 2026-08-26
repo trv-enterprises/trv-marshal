@@ -1,4 +1,4 @@
-# Alert / Automation Engine — Writing Rules
+# Marshal — Writing Rules
 
 A rule watches one MQTT topic, tests one field, and then **alerts**, **acts**,
 or both. This document is about writing those rules.
@@ -6,12 +6,12 @@ or both. This document is about writing those rules.
 Rules live in YAML and are the **only** way to configure the engine — there is
 no UI and no API. Edit the file, then deploy (or `SIGHUP` to reload in place).
 
-- Deployment rules: `homelab-deploy/files/alert-engine/rules.yaml`
+- Deployment rules: `homelab-deploy/files/marshal/rules.yaml`
 - Example rules: [`rules.yaml`](rules.yaml) in this directory
 
 ```bash
 # from homelab-deploy
-make deploy-alert-engine
+make deploy-marshal
 ```
 
 ---
@@ -153,7 +153,7 @@ rather than two:
 state (timers, override ownership):
 
 ```bash
-docker kill -s HUP services-alert-engine-1
+docker kill -s HUP services-marshal-1
 ```
 
 Topics are diffed on reload — new ones are subscribed, removed ones

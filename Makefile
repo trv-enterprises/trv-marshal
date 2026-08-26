@@ -1,18 +1,19 @@
 # Sensor Alert Engine
 # Makefile for building, testing, and deploying
 
-BINARY := alert-engine
+BINARY := marshal
 GOOS ?= linux
 GOARCH ?= amd64
 DEPLOY_HOST ?= <services-tailscale-ip>
 DEPLOY_USER ?= <user>
 REMOTE_BIN := /usr/local/bin/$(BINARY)
-REMOTE_CONFIG := /etc/alert-engine/rules.yaml
-SERVICE := alert-engine.service
+REMOTE_CONFIG := /etc/marshal/rules.yaml
+SERVICE := marshal.service
 
-# Container image. Must match alert_engine_image in the Ansible role
-# (tools/ansible/roles/alert-engine/vars/main.yml) -- the role resolves the
-# tag from alert_engine_version, so a mismatch here deploys the wrong thing.
+# Container image. Must match marshal_image in the Ansible role
+# (homelab-deploy -> trv-homelab tools/ansible/roles/marshal/vars/main.yml) --
+# the role resolves the tag from marshal_version, so a mismatch here deploys
+# the wrong thing.
 #
 # The deploy target is amd64 (services LXC on Proxmox); this is built
 # explicitly rather than inherited from the build host, which is arm64.
@@ -51,7 +52,7 @@ run: build-local ## Build and run locally
 
 .PHONY: build-local
 build-local: ## Build for local platform
-	go build -o $(BINARY) ./cmd/alert-engine/
+	go build -o $(BINARY) ./cmd/marshal/
 
 ##@ Build
 
@@ -59,7 +60,7 @@ build-local: ## Build for local platform
 build: ## Build linux binary (CGO_ENABLED=0)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build \
 		-ldflags="-s -w" \
-		-o $(BINARY) ./cmd/alert-engine/
+		-o $(BINARY) ./cmd/marshal/
 
 .PHONY: docker-build
 docker-build: ## Build Docker image (local tag, no registry)
@@ -74,7 +75,7 @@ docker-push: require-version ## Build and push VERSION=x.y.z to GHCR
 	docker push $(IMAGE):$(IMAGE_TAG)
 	@echo
 	@echo "Pushed $(IMAGE):$(IMAGE_TAG)"
-	@echo "Deploy with: make deploy-alert-engine ALERT_ENGINE_VERSION=$(IMAGE_TAG)  (from homelab-deploy)"
+	@echo "Deploy with: make deploy-marshal MARSHAL_VERSION=$(IMAGE_TAG)  (from homelab-deploy)"
 
 .PHONY: require-version
 require-version:
@@ -93,7 +94,7 @@ deploy: build ## Build and deploy to services LXC
 	ssh $(DEPLOY_USER)@$(DEPLOY_HOST) '\
 		sudo mv /tmp/$(BINARY) $(REMOTE_BIN) && \
 		sudo chmod +x $(REMOTE_BIN) && \
-		sudo mkdir -p /etc/alert-engine && \
+		sudo mkdir -p /etc/marshal && \
 		sudo mv /tmp/rules.yaml $(REMOTE_CONFIG) && \
 		sudo mv /tmp/$(SERVICE) /etc/systemd/system/$(SERVICE) && \
 		sudo systemctl daemon-reload && \

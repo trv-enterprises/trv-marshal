@@ -11,8 +11,14 @@ import (
 
 // Alert represents an alert event published to MQTT.
 type Alert struct {
-	Type      string `json:"type"`   // "new", "repeat", or "resolved"
-	Source    string `json:"source"` // always "alert_engine"
+	Type string `json:"type"` // "new", "repeat", or "resolved"
+	// Source is deliberately still "alert_engine" after the rename to Marshal.
+	// It is WIRE FORMAT: the kiosk matches on it (display/src/views/AlertView.jsx
+	// maps alert_engine -> its display label, and voice/commander.py defaults to
+	// it), so changing the string silently breaks alert display on every consumer
+	// that has not been updated in lockstep. Rename it only as a coordinated
+	// change across trv-kiosk and any other subscriber.
+	Source    string `json:"source"` // always "alert_engine" — see above
 	Severity  string `json:"severity"`
 	Rule      string `json:"rule"`
 	Message   string `json:"message"`

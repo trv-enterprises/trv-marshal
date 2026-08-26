@@ -3,7 +3,7 @@ package evaluator
 import (
 	"testing"
 
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/config"
+	"github.com/trv-enterprises/trv-marshal/internal/config"
 )
 
 func TestEvaluate_BoolEqual(t *testing.T) {

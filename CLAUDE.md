@@ -1,4 +1,4 @@
-# CLAUDE.md — sensor-alert-engine
+# CLAUDE.md — Marshal
 
 Guidance for working on the alert/automation engine. For *writing rules*, read
 [`README.md`](README.md) instead — that is the rule-authoring reference and the
@@ -23,7 +23,7 @@ Conflating the two is the most likely way to break this service.
 
 | Package | Responsibility |
 |---|---|
-| `cmd/alert-engine/` | Wiring: config load, MQTT connect, OnConnect hook, signal handling |
+| `cmd/marshal/` | Wiring: config load, MQTT connect, OnConnect hook, signal handling |
 | `internal/config/` | Rule parsing and validation |
 | `internal/evaluator/` | Condition evaluation (one field, one operator) |
 | `internal/state/` | Per-rule state: when a condition became true, last alert |
@@ -89,7 +89,7 @@ usually means subscriptions did not survive a reconnect.
 
 `restart: unless-stopped` cannot help when a service fails without exiting —
 the process stays up and the container reports healthy while the client is
-deaf. So every heartbeat also writes its verdict to `/tmp/alert-engine-health`
+deaf. So every heartbeat also writes its verdict to `/tmp/marshal-health`
 (`ok` / `unhealthy`, write-then-rename so a reader never sees a partial write),
 and the compose healthcheck reads it.
 
@@ -141,19 +141,29 @@ Worked example with full reasoning: `docs/nightlight-automation.md`.
 make test                          # fmt + vet + tests — run before committing
 make build                         # linux binary, CGO_ENABLED=0
 make docker-build                  # container image, local tag only
-make docker-push VERSION=v0.2.0-rc.8   # build + push to GHCR
+make docker-push VERSION=v0.2.1   # build + push to GHCR
 make help                          # all targets
 ```
 
-There is no CI for this repo, so `docker-push` runs on your machine. It pins
-`linux/amd64` deliberately: the build host is arm64 and the services LXC is
-not, and an inherited platform produces an image the target cannot run. Git
-tags carry a leading `v` and image tags do not — pass either, it is stripped.
+Releases run in CI (`.github/workflows/publish-containers.yml`): push a `v*`
+tag and it builds multi-arch and pushes to GHCR, gated on the tests passing.
+
+```bash
+git tag -a v0.2.1 -m "..." && git push origin v0.2.1
+# -> ghcr.io/trv-enterprises/marshal:0.2.1  (+ :latest when not a prerelease)
+```
+
+A hyphenated version is a prerelease and does NOT move `:latest` — the deploy
+role defaults to latest, so an rc must not become what an unpinned host picks
+up.
+
+`make docker-push VERSION=...` still works for a local build; it pins
+`linux/amd64` because the build host is arm64 and the services LXC is not.
 
 Then deploy from `homelab-deploy`:
 
 ```bash
-make deploy-alert-engine ALERT_ENGINE_VERSION=0.2.0-rc.8
+make deploy-marshal MARSHAL_VERSION=0.2.1
 ```
 
 Pin an explicit tag for anything that must be reproducible — the role defaults
@@ -162,5 +172,5 @@ path is duplicated between this Makefile and the role's `vars/main.yml`; change
 both together.
 
 The live ruleset is **not** the `rules.yaml` in this directory. It lives in
-`homelab-deploy/files/alert-engine/rules.yaml`; deploy with
-`make deploy-alert-engine` from there. The local file is an example only.
+`homelab-deploy/files/marshal/rules.yaml`; deploy with
+`make deploy-marshal` from there. The local file is an example only.

@@ -11,11 +11,11 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/actuator"
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/alerter"
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/config"
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/evaluator"
-	"github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine/internal/state"
+	"github.com/trv-enterprises/trv-marshal/internal/actuator"
+	"github.com/trv-enterprises/trv-marshal/internal/alerter"
+	"github.com/trv-enterprises/trv-marshal/internal/config"
+	"github.com/trv-enterprises/trv-marshal/internal/evaluator"
+	"github.com/trv-enterprises/trv-marshal/internal/state"
 )
 
 const (
@@ -69,7 +69,7 @@ const (
 // restart. Nothing outside the container reads it, so it is not a bind mount.
 //
 // A var rather than a const solely so tests can redirect it to a temp dir.
-var healthPath = "/tmp/alert-engine-health"
+var healthPath = "/tmp/marshal-health"
 
 // Engine is the core alert processing engine.
 type Engine struct {

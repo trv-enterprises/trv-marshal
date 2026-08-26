@@ -1,4 +1,4 @@
-module github.com/trv-enterprises/trv-homelab/edge/sensor-alert-engine
+module github.com/trv-enterprises/trv-marshal
 
 go 1.25.14
 
