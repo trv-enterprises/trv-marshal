@@ -14,7 +14,11 @@ const (
 )
 
 func eval(t *Tracker, met bool, now time.Time, delay int) []Command {
-	return t.Evaluate("r", met, onTopic, onPayl, onTopic, offPayl, delay, ttlMin, now)
+	return t.Evaluate("r", met, true, onTopic, onPayl, onTopic, offPayl, delay, ttlMin, now)
+}
+
+func evalGated(t *Tracker, met, gateOK bool, now time.Time, delay int) []Command {
+	return t.Evaluate("r", met, gateOK, onTopic, onPayl, onTopic, offPayl, delay, ttlMin, now)
 }
 
 func TestRisingEdgeCommandsOn(t *testing.T) {
@@ -248,5 +252,66 @@ func TestMotionWorksNormallyAfterResume(t *testing.T) {
 	due := tr.Sweep(specs, off.Add(time.Duration(offDelay+5)*time.Second))
 	if len(due) != 1 || due[0].Command.Payload != offPayl {
 		t.Fatalf("expected the deferred off to fire, got %+v", due)
+	}
+}
+
+// A failed gate suppresses the on-command but the rising edge is still
+// recorded, so a later falling edge does not produce a spurious off.
+func TestGateFailedSuppressesOn(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+
+	if cmds := evalGated(tr, true, false, now, 0); cmds != nil {
+		t.Fatalf("gated rising edge should command nothing, got %+v", cmds)
+	}
+	// Falling edge: nothing was turned on, so nothing to turn off.
+	if cmds := evalGated(tr, false, true, now.Add(time.Second), 0); cmds != nil {
+		t.Fatalf("falling edge after gated on should command nothing, got %+v", cmds)
+	}
+}
+
+// The gate never affects the off path: a device turned on under a passing
+// gate still turns off normally even if the gate would fail by then.
+func TestGateDoesNotBlockOff(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+
+	evalGated(tr, true, true, now, 0)
+	if cmds := evalGated(tr, false, false, now.Add(time.Second), 0); len(cmds) != 1 || cmds[0].Payload != offPayl {
+		t.Fatalf("expected off-command regardless of gate, got %+v", cmds)
+	}
+}
+
+// A gate-failed rising edge must NOT cancel a pending off: the device is on
+// from an earlier cycle and conditions no longer justify it, so the scheduled
+// off should still fire.
+func TestGateFailedRisingEdgeKeepsPendingOff(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+
+	evalGated(tr, true, true, now, offDelay)                   // on
+	evalGated(tr, false, true, now.Add(time.Second), offDelay) // off armed
+	// New motion, but the gate now fails (room got bright).
+	if cmds := evalGated(tr, true, false, now.Add(2*time.Second), offDelay); cmds != nil {
+		t.Fatalf("gated rising edge should command nothing, got %+v", cmds)
+	}
+
+	specs := map[string]SweepSpec{"r": {OffTopic: onTopic, OffPayload: offPayl, TTLMinutes: ttlMin}}
+	due := tr.Sweep(specs, now.Add(time.Duration(offDelay+5)*time.Second))
+	if len(due) != 1 || due[0].Command.Payload != offPayl {
+		t.Fatalf("pending off should survive a gated rising edge, got %+v", due)
+	}
+}
+
+// After a gate-suppressed on, the next motion cycle with a passing gate
+// works normally — the suppressed edge leaves no stuck state behind.
+func TestGateRecoversNextCycle(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+
+	evalGated(tr, true, false, now, 0)                  // suppressed
+	evalGated(tr, false, true, now.Add(time.Second), 0) // clears
+	if cmds := evalGated(tr, true, true, now.Add(2*time.Second), 0); len(cmds) != 1 || cmds[0].Payload != onPayl {
+		t.Fatalf("expected on-command once gate passes, got %+v", cmds)
 	}
 }

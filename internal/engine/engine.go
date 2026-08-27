@@ -324,7 +324,7 @@ func (e *Engine) handleMessage(topic string, payload []byte) {
 
 		// Action path: edge-triggered, ownership-arbitrated.
 		if rule.Action != nil {
-			e.processActuation(rule, conditionMet, now)
+			e.processActuation(rule, conditionMet, e.gateOK(rule, conditionMet, payload), now)
 		}
 	}
 }
@@ -359,11 +359,35 @@ func (e *Engine) handleControl(topic string, payload []byte, now time.Time) {
 	}
 }
 
+// gateOK evaluates a rule's action gate against the triggering payload. True
+// when no gate is configured or the condition is not met (the gate only
+// matters on a rising edge). A gate that cannot be evaluated — field missing
+// from the payload, type mismatch — fails open with a warning, per the
+// ActionSpec.Gate contract.
+func (e *Engine) gateOK(rule config.Rule, conditionMet bool, payload []byte) bool {
+	if rule.Action.Gate == nil || !conditionMet {
+		return true
+	}
+	ok, err := evaluator.EvaluateCondition(payload, *rule.Action.Gate)
+	if err != nil {
+		slog.Warn("gate evaluation error, failing open",
+			"rule", rule.Name,
+			"field", rule.Action.Gate.Field,
+			"error", err,
+		)
+		return true
+	}
+	if !ok {
+		slog.Debug("gate not satisfied", "rule", rule.Name, "field", rule.Action.Gate.Field)
+	}
+	return ok
+}
+
 // processActuation runs the edge-triggered action path for one rule.
-func (e *Engine) processActuation(rule config.Rule, conditionMet bool, now time.Time) {
+func (e *Engine) processActuation(rule config.Rule, conditionMet, gateOK bool, now time.Time) {
 	a := rule.Action
 	cmds := e.actuators.Evaluate(
-		rule.Name, conditionMet,
+		rule.Name, conditionMet, gateOK,
 		a.Topic, a.Payload,
 		a.OffTopicOrDefault(), a.OffPayload,
 		a.OffDelaySeconds, a.OverrideTTLMinutes,

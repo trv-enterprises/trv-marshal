@@ -275,3 +275,52 @@ func TestTopicsIncludeControlTopics(t *testing.T) {
 		}
 	}
 }
+
+func TestActionGateLoadsAndValidates(t *testing.T) {
+	cfg, err := Load(writeTemp(t, mqttHeader+`
+  - name: gated
+    topic: "t"
+    condition: {field: occupancy, operator: eq, value: true}
+    action:
+      topic: "x/set"
+      payload: "ON"
+      gate: {field: illuminance, operator: lt, value: 15}
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g := cfg.Rules[0].Action.Gate
+	if g == nil || g.Field != "illuminance" || g.Operator != "lt" {
+		t.Fatalf("gate not loaded, got %+v", g)
+	}
+}
+
+func TestActionGateRejectsBadOperator(t *testing.T) {
+	_, err := Load(writeTemp(t, mqttHeader+`
+  - name: bad
+    topic: "t"
+    condition: {field: occupancy, operator: eq, value: true}
+    action:
+      topic: "x/set"
+      payload: "ON"
+      gate: {field: illuminance, operator: dim, value: 15}
+`))
+	if err == nil {
+		t.Fatal("expected error for invalid gate operator")
+	}
+}
+
+func TestActionGateRequiresValue(t *testing.T) {
+	_, err := Load(writeTemp(t, mqttHeader+`
+  - name: bad
+    topic: "t"
+    condition: {field: occupancy, operator: eq, value: true}
+    action:
+      topic: "x/set"
+      payload: "ON"
+      gate: {field: illuminance, operator: lt}
+`))
+	if err == nil {
+		t.Fatal("expected error for gate without value")
+	}
+}

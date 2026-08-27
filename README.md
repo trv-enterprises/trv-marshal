@@ -93,6 +93,24 @@ threshold — and can publish to any MQTT topic.
 `off_topic` is only needed if the off-command goes somewhere other than
 `topic`.
 
+### Gate — an extra check before turning on
+
+An optional `gate` is a second condition, evaluated against the **same
+payload** as the trigger, consulted **only on the rising edge**:
+
+```yaml
+    action:
+      gate: {field: "illuminance", operator: "lt", value: 15}
+```
+
+A failed gate suppresses the on-command; nothing else changes. The gate never
+generates edges, never blocks the off path, and never cancels a pending off —
+so gating a light on its own illuminance sensor cannot oscillate: once the
+light is on under a passing gate it runs a normal motion cycle, and a bright
+reading can only stop the *next* turn-on. If the gate field is missing from a
+payload the gate fails open (with a warning), on the theory that a nightlight
+losing its light sensor should degrade to a plain motion light, not go dark.
+
 ### Manual override
 
 Without this, an automation rule and a human fight over the device. These

@@ -13,7 +13,7 @@ func TestSelfCommandEchoIsNotAnOverride(t *testing.T) {
 	tr := NewTracker()
 	now := time.Now()
 
-	cmds := tr.Evaluate("r", true, "x/set", "ON", "x/set", "OFF", 0, 30, now)
+	cmds := tr.Evaluate("r", true, true, "x/set", "ON", "x/set", "OFF", 0, 30, now)
 	if len(cmds) != 1 {
 		t.Fatalf("expected on-command, got %+v", cmds)
 	}
@@ -33,7 +33,7 @@ func TestRealOverrideOnSharedTopicStillWins(t *testing.T) {
 	tr := NewTracker()
 	now := time.Now()
 
-	tr.Evaluate("r", true, "x/set", "ON", "x/set", "OFF", 0, 30, now)
+	tr.Evaluate("r", true, true, "x/set", "ON", "x/set", "OFF", 0, 30, now)
 	tr.NoteSelfCommand("r")
 	tr.NoteOverride("r", now.Add(time.Millisecond)) // our echo, consumed
 

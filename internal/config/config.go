@@ -78,6 +78,16 @@ type ActionSpec struct {
 	OverrideTTLMinutes int    `yaml:"override_ttl_minutes"`
 	EnableTopic        string `yaml:"enable_topic"`
 	StateTopic         string `yaml:"state_topic"`
+
+	// Gate is an optional extra condition, evaluated against the same payload
+	// as the rule condition, consulted only on the rising edge: when it fails,
+	// the on-command is not published. It never generates edges of its own and
+	// never affects the off path, so a gate on a self-influencing field (e.g. a
+	// light gated on its own illuminance sensor) cannot oscillate. If the gate
+	// field is missing from the payload the gate fails open (the on-command is
+	// published) — for a nightlight, a lost sensor reading should degrade to
+	// "plain motion light", not "no light".
+	Gate *Condition `yaml:"gate"`
 }
 
 // Condition defines the field comparison for a rule.
@@ -231,6 +241,17 @@ func (a *ActionSpec) validate(index int, name string) error {
 	// An off_payload with no off path configured is a silent no-op; catch it.
 	if a.OffPayload == "" && (a.OffTopic != "" || a.OffDelaySeconds > 0) {
 		return fmt.Errorf("rule[%d] %q: action.off_payload is required when off_topic or off_delay_seconds is set", index, name)
+	}
+	if a.Gate != nil {
+		if a.Gate.Field == "" {
+			return fmt.Errorf("rule[%d] %q: action.gate.field is required", index, name)
+		}
+		if !slices.Contains(validOperators, a.Gate.Operator) {
+			return fmt.Errorf("rule[%d] %q: invalid gate operator %q (must be one of %v)", index, name, a.Gate.Operator, validOperators)
+		}
+		if a.Gate.Value == nil {
+			return fmt.Errorf("rule[%d] %q: action.gate.value is required", index, name)
+		}
 	}
 	return nil
 }

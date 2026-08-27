@@ -11,17 +11,23 @@ import (
 // Evaluate checks whether a JSON payload satisfies a rule's condition.
 // Returns true if the condition is met (alert state).
 func Evaluate(payload []byte, rule config.Rule) (bool, error) {
+	return EvaluateCondition(payload, rule.Condition)
+}
+
+// EvaluateCondition checks whether a JSON payload satisfies a single
+// condition. Used for both a rule's trigger condition and an action's gate.
+func EvaluateCondition(payload []byte, cond config.Condition) (bool, error) {
 	var data map[string]any
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return false, fmt.Errorf("parsing JSON: %w", err)
 	}
 
-	actual, err := extractField(data, rule.Condition.Field)
+	actual, err := extractField(data, cond.Field)
 	if err != nil {
 		return false, err
 	}
 
-	return compare(actual, rule.Condition.Operator, rule.Condition.Value)
+	return compare(actual, cond.Operator, cond.Value)
 }
 
 // extractField retrieves a value from a nested map using dot-notation.

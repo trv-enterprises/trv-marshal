@@ -111,7 +111,14 @@ func (t *Tracker) Owner(rule string, ttlMinutes int, now time.Time) Owner {
 // Rising edge  → the on-command, and any pending off is cancelled.
 // Falling edge → the off-command, deferred by offDelay (fired later by Sweep
 // when the delay is non-zero).
-func (t *Tracker) Evaluate(rule string, conditionMet bool, onTopic, onPayload, offTopic, offPayload string, offDelaySeconds, ttlMinutes int, now time.Time) []Command {
+//
+// gateOK is the rule's gate verdict for this payload (true when no gate is
+// configured). It is consulted only on the rising edge: a failed gate
+// suppresses the on-command but still records the edge, and deliberately does
+// NOT cancel a pending off — if the device is on from an earlier cycle and the
+// gate now fails (e.g. the room got bright), letting the scheduled off fire is
+// the correct outcome.
+func (t *Tracker) Evaluate(rule string, conditionMet, gateOK bool, onTopic, onPayload, offTopic, offPayload string, offDelaySeconds, ttlMinutes int, now time.Time) []Command {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -133,6 +140,9 @@ func (t *Tracker) Evaluate(rule string, conditionMet bool, onTopic, onPayload, o
 	}
 
 	if conditionMet {
+		if !gateOK {
+			return nil
+		}
 		s.offDueAt = time.Time{}
 		s.commandedOn = true
 		return []Command{{Topic: onTopic, Payload: onPayload}}

@@ -55,6 +55,11 @@ rules:
       payload: '{"state":"ON","brightness":120}'
       off_payload: '{"state":"OFF"}'
       off_delay_seconds: 120
+      # Optional: only turn on when it's dark. Checked against the same
+      # payload as the condition, on the rising edge only -- it never blocks
+      # or cancels the off path, so a light gated on its own illuminance
+      # sensor cannot oscillate.
+      gate: {field: "illuminance", operator: "lt", value: 15}
       override_topic: "zigbee2mqtt/my_light/set"
       override_ttl_minutes: 30
       enable_topic: "automation/hallway/enable"
