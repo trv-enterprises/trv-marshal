@@ -33,9 +33,18 @@ const (
 	// This is a liveness backstop, not a traffic expectation: the trigger is
 	// silence on a connection paho believes is up, which is the signature of a
 	// half-open socket the broker has already discarded. Zigbee devices here
-	// report at least on a periodic heartbeat, so 20 minutes of total silence
-	// across every subscribed topic is a fault rather than a quiet house.
-	stallTimeout = 20 * time.Minute
+	// report at least on a periodic heartbeat, so five minutes of total
+	// silence across every subscribed topic is a fault rather than a quiet
+	// house. Was 20m; shortened after the 2026-08-27 double stall, where the
+	// long window meant up to twenty dark minutes per occurrence.
+	stallTimeout = 5 * time.Minute
+
+	// inboxDepth bounds the internal message queue between paho's router and
+	// the engine's serial dispatcher. Sized for bursts (Z2M can publish
+	// several duplicates per device per second), not sustained backlog: if
+	// the dispatcher cannot keep up at this depth something is wedged, and
+	// dropping with an error beats blocking paho's router.
+	inboxDepth = 256
 
 	// Recovery timings. Every one of these is a bound on a paho call that can
 	// otherwise block or silently no-op; none may be zero.
@@ -50,18 +59,23 @@ const (
 	// overlapping the following one.
 	connectWait = 30 * time.Second
 
+	// publishWait bounds every QoS 1 publish. These run on the dispatcher
+	// goroutine, where an unbounded Wait on a dying client freezes all
+	// message processing until the watchdog fires.
+	publishWait = 10 * time.Second
+
 	// unhealthyTimeout is when silence starts being reported as UNHEALTHY to
 	// the container healthcheck. Deliberately shorter than stallTimeout.
 	//
-	// The two thresholds answer different questions. stallTimeout (20m) gates
-	// RECOVERY and is long to avoid thrashing a connection that is merely
-	// quiet. unhealthyTimeout gates the health VERDICT, and 20m is far too
-	// long there: on 2026-08-25 the engine was deaf for twenty minutes while
-	// the container reported healthy the whole time, because the verdict was
-	// keyed on `stalled`. Reporting unhealthy sooner lets recovery attempt the
-	// repair first, and the healthcheck's own retries add further delay before
-	// anything restarts.
-	unhealthyTimeout = 12 * time.Minute
+	// The two thresholds answer different questions. stallTimeout (5m) gates
+	// RECOVERY and is the longer of the two to avoid thrashing a connection
+	// that is merely quiet. unhealthyTimeout gates the health VERDICT and
+	// must sour first: on 2026-08-25 the engine was deaf for twenty minutes
+	// while the container reported healthy the whole time, because the
+	// verdict was keyed on `stalled`. Reporting unhealthy sooner lets
+	// recovery attempt the repair first, and the healthcheck's own retries
+	// add further delay before anything restarts.
+	unhealthyTimeout = 3 * time.Minute
 )
 
 // healthPath is where each heartbeat records its verdict for the
@@ -81,6 +95,20 @@ type Engine struct {
 	alerter    *alerter.Alerter
 	configPath string
 	stopSweep  chan struct{}
+
+	// inbox decouples paho's delivery goroutine from message processing.
+	//
+	// The client runs with order matters (paho's default), so handlers are
+	// invoked synchronously on the router goroutine and MUST NOT block. The
+	// engine's processing path blocks by design — publishCommand waits for
+	// the QoS 1 PUBACK, which arrives through the same inbound machinery the
+	// handler is holding up. Under load that is a progressive starvation:
+	// on 2026-08-27 per-heartbeat message counts decayed 65 → 19 → 4 → 0
+	// twice in one evening while paho reported connected the whole time.
+	// The subscribe callback therefore only enqueues; a single dispatcher
+	// goroutine drains the queue, preserving per-topic message order (one
+	// worker) without ever blocking the router.
+	inbox chan inboundMsg
 
 	// newClient builds a REPLACEMENT MQTT client during recovery.
 	//
@@ -119,7 +147,9 @@ type mqttPublisher struct {
 
 func (p *mqttPublisher) Publish(topic string, payload []byte) error {
 	token := p.client.Publish(topic, 1, false, payload) // QoS 1
-	token.Wait()
+	if !token.WaitTimeout(publishWait) {
+		return fmt.Errorf("publish to %q timed out", topic)
+	}
 	return token.Error()
 }
 
@@ -137,7 +167,38 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 		alerter:    a,
 		configPath: configPath,
 		stopSweep:  make(chan struct{}),
+		inbox:      make(chan inboundMsg, inboxDepth),
 		startedAt:  time.Now(),
+	}
+}
+
+// inboundMsg is one MQTT message awaiting dispatch.
+type inboundMsg struct {
+	topic   string
+	payload []byte
+}
+
+// enqueue hands a message from paho's router to the dispatcher without
+// blocking. A full inbox means the dispatcher is wedged or drowning; the
+// message is dropped with an error, because stalling paho's router here is
+// how the whole client goes deaf.
+func (e *Engine) enqueue(topic string, payload []byte) {
+	select {
+	case e.inbox <- inboundMsg{topic: topic, payload: payload}:
+	default:
+		slog.Error("inbox full, dropping message", "topic", topic, "depth", inboxDepth)
+	}
+}
+
+// dispatchLoop serially processes enqueued messages until Stop.
+func (e *Engine) dispatchLoop() {
+	for {
+		select {
+		case <-e.stopSweep:
+			return
+		case m := <-e.inbox:
+			e.handleMessage(m.topic, m.payload)
+		}
 	}
 }
 
@@ -174,6 +235,7 @@ func (e *Engine) Start() error {
 	// than a fault.
 	e.writeHealth(true)
 
+	go e.dispatchLoop()
 	go e.sweepLoop()
 	go e.heartbeatLoop()
 	return nil
@@ -198,8 +260,10 @@ func (e *Engine) SubscribeAll() error {
 
 	for _, topic := range topics {
 		t := topic // capture for closure
+		// Enqueue only — processing happens on the dispatcher goroutine.
+		// This callback runs on paho's router and must never block.
 		token := e.client.Subscribe(t, 1, func(_ mqtt.Client, msg mqtt.Message) {
-			e.handleMessage(msg.Topic(), msg.Payload())
+			e.enqueue(msg.Topic(), msg.Payload())
 		})
 		if !token.WaitTimeout(10 * time.Second) {
 			return fmt.Errorf("subscribing to %q: timed out", t)
@@ -248,7 +312,7 @@ func (e *Engine) Reload() error {
 		if !oldTopics[topic] {
 			t := topic
 			token := e.client.Subscribe(t, 1, func(_ mqtt.Client, msg mqtt.Message) {
-				e.handleMessage(msg.Topic(), msg.Payload())
+				e.enqueue(msg.Topic(), msg.Payload())
 			})
 			token.Wait()
 			if err := token.Error(); err != nil {
@@ -410,7 +474,13 @@ func (e *Engine) processActuation(rule config.Rule, conditionMet, gateOK bool, n
 // publishCommand sends a single actuation command.
 func (e *Engine) publishCommand(ruleName string, c actuator.Command) {
 	token := e.client.Publish(c.Topic, 1, false, c.Payload)
-	token.Wait()
+	// Bounded wait: this runs on the dispatcher goroutine, and an unbounded
+	// Wait on a dying client would freeze all message processing until the
+	// watchdog notices. A timed-out publish is logged and abandoned.
+	if !token.WaitTimeout(publishWait) {
+		slog.Error("publish timed out", "rule", ruleName, "topic", c.Topic)
+		return
+	}
 	if err := token.Error(); err != nil {
 		slog.Error("failed to publish command", "rule", ruleName, "topic", c.Topic, "error", err)
 		return
@@ -429,7 +499,10 @@ func (e *Engine) publishOwnerState(rule config.Rule, now time.Time) {
 	}
 	owner := e.actuators.Owner(rule.Name, rule.Action.OverrideTTLMinutes, now)
 	token := e.client.Publish(rule.Action.StateTopic, 1, true, owner.String())
-	token.Wait()
+	if !token.WaitTimeout(publishWait) {
+		slog.Error("owner state publish timed out", "rule", rule.Name)
+		return
+	}
 	if err := token.Error(); err != nil {
 		slog.Error("failed to publish owner state", "rule", rule.Name, "error", err)
 	}
