@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -434,9 +435,40 @@ func (e *Engine) publishOwnerState(rule config.Rule, now time.Time) {
 	}
 }
 
-// parseEnable interprets an enable-topic payload as a boolean.
+// parseEnable interprets an enable-topic payload as a boolean. Two wire
+// forms are accepted:
+//
+//   - a bare string: "on"/"true"/"1"/"enable"/"enabled" (and the off
+//     counterparts) — the original convention, what the Homebridge codec
+//     and mosquitto_pub speak;
+//   - a JSON object {"enable": <v>} where <v> is a boolean or one of the
+//     bare-string words — for publishers that can only emit JSON objects
+//     (the dashboard's mqtt_publish control).
+//
+// Anything else — including {} and JSON without an "enable" key — is
+// rejected, and the caller logs it rather than guessing.
 func parseEnable(payload []byte) (bool, bool) {
-	switch strings.ToLower(strings.TrimSpace(string(payload))) {
+	trimmed := strings.TrimSpace(string(payload))
+	if strings.HasPrefix(trimmed, "{") {
+		var obj struct {
+			Enable any `json:"enable"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+			return false, false
+		}
+		switch v := obj.Enable.(type) {
+		case bool:
+			return v, true
+		case string:
+			return parseEnableWord(v)
+		}
+		return false, false
+	}
+	return parseEnableWord(trimmed)
+}
+
+func parseEnableWord(word string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(word)) {
 	case "true", "on", "1", "enable", "enabled":
 		return true, true
 	case "false", "off", "0", "disable", "disabled":

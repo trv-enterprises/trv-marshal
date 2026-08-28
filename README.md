@@ -132,7 +132,10 @@ settings decide who owns it:
   "force on" nobody remembers to clear is how a light ends up on at noon.
 - **`enable_topic`** — publish `false` to park automation entirely; `true`
   resumes it *and* clears any active override, so it doubles as "give control
-  back now".
+  back now". Two payload forms are accepted: a bare string (`on`, `off`,
+  `true`, `1`, …) or a JSON object `{"enable": true}` / `{"enable": "off"}`
+  for publishers that can only emit JSON objects. Anything else — `{}`
+  included — is logged and ignored, never guessed.
 - **`state_topic`** — the engine publishes who is currently in charge:
   `automation`, `override`, or `parked`. Retained, so a display can read it on
   startup.
