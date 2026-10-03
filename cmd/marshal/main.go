@@ -215,10 +215,21 @@ func connectMQTT(mqttCfg config.MQTTConfig, hook *onConnect) (mqtt.Client, error
 	client := mqtt.NewClient(opts)
 	token := client.Connect()
 
+	// A client that is not returned must be stopped, not just dropped.
+	//
+	// ConnectRetry keeps Connect() trying after this function has given up
+	// waiting, so an abandoned client connects by itself whenever the broker
+	// next answers -- with the same client ID as whichever client the engine
+	// builds next. The two then evict each other on every reconnect, which is
+	// the 2026-08-23 takeover loop again. Verified against a real broker on
+	// 2026-10-03: after a 30s timeout here, the abandoned client connected the
+	// moment the broker came back. Disconnect() aborts the retry.
 	if !token.WaitTimeout(30 * time.Second) {
+		client.Disconnect(0)
 		return nil, fmt.Errorf("MQTT connect timeout after 30s")
 	}
 	if token.Error() != nil {
+		client.Disconnect(0)
 		return nil, fmt.Errorf("MQTT connect: %w", token.Error())
 	}
 

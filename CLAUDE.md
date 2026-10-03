@@ -52,7 +52,8 @@ is invisible unless you are looking for *absence*.
 - **`IsConnected()` reports intent, not socket health.** With auto-reconnect
   enabled it keeps returning true while paho believes it owns a connection, so
   a client evicted by the broker reports healthy indefinitely. Prolonged
-  inbound silence is the real signal.
+  inbound silence is the real signal — measured on the loopback probe, never
+  on device traffic (see *The loopback probe and the watchdog* below).
 - **`Disconnect()` is a trap in a recovery path.** It marks the session
   user-requested, which suppresses auto-reconnect, and it transitions status
   asynchronously. A `Connect()` immediately after it is rejected with
@@ -64,6 +65,13 @@ is invisible unless you are looking for *absence*.
   returns early once already disconnected. **Recovery builds a NEW client**
   (`SetClientFactory`) — a fresh one starts at `disconnected`, so its
   `Connect()` is always legal. Adopt it only once connected.
+- **An abandoned client keeps connecting.** With `ConnectRetry`, `Connect()`
+  goes on trying after the caller has stopped waiting on its token. A client
+  that is built and then dropped on a timeout connects by itself when the
+  broker next answers, under the same client ID as its successor, and the two
+  evict each other on every reconnect. `connectMQTT` therefore calls
+  `Disconnect()` on any client it does not return. Verified against a real
+  broker on 2026-10-03.
 - **`Connect()` does not replay subscriptions** under CleanSession. Every
   reconnect path must resubscribe explicitly. That is what `SubscribeAll` is
   for, and why `OnConnect` calls it.
@@ -77,33 +85,66 @@ The double subscribe seen in the logs at startup is intentional, not a bug:
 the resubscribe hook is wired. The explicit `SubscribeAll()` in `main` covers
 that first connection; subscribing twice is idempotent at the broker.
 
+### The loopback probe and the watchdog
+
+**Device silence is not a liveness signal.** The seven devices subscribed today
+routinely go four to twelve minutes without publishing. From v0.4.1 until
+2026-10-03 the watchdog read that as a half-open socket, and autoheal restarted
+the container 25–39 times a day — each restart discarding hold timers,
+overrides and parking. Nothing was ever deaf; Zigbee2MQTT's own log showed no
+publishes in any "stall" window.
+
+So the engine proves its own connection instead of inferring it. Every
+`watchdogInterval` (30s) it publishes a probe to `marshal/loopback/<host>-<pid>`
+and consumes it in `handleMessage`, after the inbox and on the dispatcher, so a
+probe that comes back proves the whole inbound chain. `lastInboundAt` moves on
+any arrival; the thresholds are measured against it.
+
+Three rules that are easy to break:
+
+- **Only a real arrival may move `lastInboundAt`.** `reconnect()` used to reset
+  the last-message time to space out retries. With the verdict evaluated every
+  tick, that reset would make a wedged engine read `ok` after every attempt and
+  autoheal would never fire. Retries are spaced by `lastRecoveryAt` instead.
+- **The probe is not a device message.** It stays out of `messages_total` and
+  `last_message_age_sec`, which exist to show what the house is doing.
+- **The topic is per process.** Two overlapping instances must not keep each
+  other looking alive.
+
 ### The heartbeat
 
-The heartbeat exists to make *absence* alertable. `messages_total` counts what
-actually arrived from the broker — repeated heartbeats reporting zero while
-devices are known to be publishing is a stall, and `last_message_age_sec` says
-how long it has been going on. `-1` means no message has *ever* arrived, which
-usually means subscriptions did not survive a reconnect.
+The heartbeat exists to make *absence* alertable, and it only reports — the
+verdict and recovery belong to the watchdog. Read its two ages together:
+`last_message_age_sec` is the house, `loopback_age_sec` is the engine. A large
+message age with a small loopback age is a quiet house. A loopback age growing
+past a couple of watchdog intervals is the engine going deaf. `-1` on either
+means it has *never* arrived; on the loopback that usually means subscriptions
+did not survive a reconnect.
 
 ### Health file and the container healthcheck
 
 `restart: unless-stopped` cannot help when a service fails without exiting —
 the process stays up and the container reports healthy while the client is
-deaf. So every heartbeat also writes its verdict to `/tmp/marshal-health`
+deaf. So every watchdog tick writes its verdict to `/tmp/marshal-health`
 (`ok` / `unhealthy`, write-then-rename so a reader never sees a partial write),
 and the compose healthcheck reads it.
 
 **The check requires both recent contents and a recent mtime.** Contents alone
-would report the last verdict forever if the heartbeat goroutine died; mtime
+would report the last verdict forever if the watchdog goroutine died; mtime
 alone would miss a client that is up but receiving nothing. `Start()` seeds the
 file so a normal boot is not read as a fault.
 
+**The verdict is written every tick, not every heartbeat.** When only the
+five-minute heartbeat wrote it, one `unhealthy` stood for five minutes — longer
+than the healthcheck's three retries — so a single bad reading restarted the
+container and self-recovery could never clear it in time.
+
 **The health verdict uses `unhealthyTimeout`, not `stalled`.** They answer
-different questions: `stallTimeout` (20m) gates *recovery*, where thrashing is
-worse than waiting, while the health verdict must sour sooner or a deaf engine
-reports healthy right up to the moment it repairs itself. Keying the verdict on
-`stalled` is exactly why a twenty-minute deafness reported `(healthy)`
-throughout on 2026-08-25.
+different questions: `stallTimeout` (5m) gates *recovery*, where thrashing is
+worse than waiting, while the health verdict (3m) must sour sooner or a deaf
+engine reports healthy right up to the moment it repairs itself. Keying the
+verdict on `stalled` (then 20m) is exactly why a twenty-minute deafness
+reported `(healthy)` throughout on 2026-08-25.
 
 Docker only *marks* a container unhealthy — it never restarts one. The
 `autoheal` service in the services stack does that, scoped to containers

@@ -41,6 +41,9 @@ type fakeClient struct {
 	// connectFails makes every Connect() fail, modelling a replacement client
 	// that cannot reach the broker.
 	connectFails error
+
+	subscribed []string
+	published  []string
 }
 
 func (f *fakeClient) IsConnectionOpen() bool {
@@ -83,10 +86,26 @@ func (f *fakeClient) Connect() mqtt.Token {
 }
 
 func (f *fakeClient) Subscribe(topic string, qos byte, cb mqtt.MessageHandler) mqtt.Token {
+	f.mu.Lock()
+	f.subscribed = append(f.subscribed, topic)
+	f.mu.Unlock()
 	if f.subscribe != nil {
 		return f.subscribe()
 	}
 	return &fakeToken{}
+}
+
+func (f *fakeClient) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.published = append(f.published, topic)
+	return &fakeToken{}
+}
+
+func (f *fakeClient) topics(of func(*fakeClient) []string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), of(f)...)
 }
 
 func (f *fakeClient) connectCount() int {
@@ -117,6 +136,31 @@ func (t *fakeToken) Done() <-chan struct{} {
 
 func newTestEngine(c mqtt.Client) *Engine {
 	return New(&config.Config{AlertTopic: "sensors/alerts"}, c, "")
+}
+
+// useTempHealthFile points the health file at a temp dir for one test.
+func useTempHealthFile(t *testing.T) {
+	t.Helper()
+	orig := healthPath
+	healthPath = t.TempDir() + "/health"
+	t.Cleanup(func() { healthPath = orig })
+}
+
+// countingFactory returns a client factory and a counter of how many
+// replacement clients it has been asked for.
+func countingFactory(build func() mqtt.Client) (func() mqtt.Client, *int) {
+	n := 0
+	return func() mqtt.Client { n++; return build() }, &n
+}
+
+// heard sets when the engine last heard anything at all, and when it last
+// heard a device, relative to now.
+func (e *Engine) heard(now time.Time, inboundAgo, deviceAgo time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lastInboundAt = now.Add(-inboundAgo)
+	e.lastLoopbackAt = now.Add(-inboundAgo)
+	e.lastMsgAt = now.Add(-deviceAgo)
 }
 
 // The regression test for the outage. A wedged paho client can refuse
@@ -189,54 +233,183 @@ func TestReconnectSurvivesNilFromFactory(t *testing.T) {
 // ever true while connected. Once a failed attempt left the client
 // disconnected, no condition could fire again. Recovery must also trigger on a
 // plain loss of connection.
-func TestUnhealthyTriggersOnDisconnectedNotOnlyStalled(t *testing.T) {
-	// Disconnected and never stalled: lastMsgAt is recent, so the old
-	// `stalled`-only gate would not have fired at all.
-	c := &fakeClient{open: false, settleAfter: 1}
+func TestWatchdogRecoversADisconnectedClientThatIsNotStalled(t *testing.T) {
+	useTempHealthFile(t)
+	now := time.Now()
+
+	// Disconnected and never stalled: something arrived seconds ago, so the
+	// old `stalled`-only gate would not have fired at all.
+	c := &fakeClient{open: false}
 	fresh := &fakeClient{}
 	e := newTestEngine(c)
 	e.SetClientFactory(func() mqtt.Client { return fresh })
+	e.heard(now, time.Second, time.Second)
 
-	e.mu.Lock()
-	e.lastMsgAt = time.Now()
-	e.mu.Unlock()
-
-	connected := c.IsConnected()
-	stalled := connected && time.Since(time.Now()) > stallTimeout
-
-	if stalled {
-		t.Fatal("precondition: this case must not be stalled")
-	}
-	if stalled || !connected {
-		e.reconnect()
-	} else {
-		t.Fatal("recovery condition did not fire for a disconnected client")
-	}
+	e.watchdogTick(now)
 
 	if !fresh.isOpen() {
 		t.Fatal("engine did not recover from a plain disconnect")
 	}
+	if got := readFile(t, healthPath); got != "unhealthy\n" {
+		t.Fatalf("a disconnected client wrote %q, want unhealthy", got)
+	}
 }
 
-// reconnect() resets lastMsgAt so a recovery that itself fails silently does
-// not immediately re-trigger the watchdog on the very next tick.
-func TestReconnectResetsMessageAgeSoRetriesAreSpaced(t *testing.T) {
-	c := &fakeClient{open: true, settleAfter: 1}
+// The regression test for the restart loop found on 2026-10-03. The house
+// going quiet is not a fault: the seven devices here routinely go four to
+// twelve minutes without publishing. As long as the loopback probe keeps
+// coming back, the verdict stays ok and nothing reconnects.
+func TestQuietHouseIsNeitherUnhealthyNorStalled(t *testing.T) {
+	useTempHealthFile(t)
+	now := time.Now()
+
+	c := &fakeClient{open: true}
 	e := newTestEngine(c)
+	factory, built := countingFactory(func() mqtt.Client { return &fakeClient{} })
+	e.SetClientFactory(factory)
+
+	// No device has spoken for twenty minutes; the probe came back just now.
+	e.heard(now, 10*time.Second, 20*time.Minute)
+
+	e.watchdogTick(now)
+
+	if got := readFile(t, healthPath); got != "ok\n" {
+		t.Fatalf("quiet house wrote %q, want ok", got)
+	}
+	if *built != 0 {
+		t.Fatalf("quiet house triggered %d reconnect(s), want 0", *built)
+	}
+	if isStalled(true, 10*time.Second) {
+		t.Fatal("a fresh loopback must not read as stalled")
+	}
+}
+
+// The probe must travel the same path as a device message and must not be
+// mistaken for one: it moves the liveness clock and nothing else.
+func TestLoopbackMovesLivenessButIsNotADeviceMessage(t *testing.T) {
+	e := newTestEngine(&fakeClient{open: true})
+	now := time.Now()
+	e.heard(now, time.Hour, time.Hour)
+
+	e.handleMessage(e.loopbackTopic, []byte("1"))
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(e.lastInboundAt) > time.Minute {
+		t.Fatal("loopback did not move lastInboundAt")
+	}
+	if e.msgCount != 0 {
+		t.Fatalf("loopback counted as %d device message(s), want 0", e.msgCount)
+	}
+	if time.Since(e.lastMsgAt) < 59*time.Minute {
+		t.Fatal("loopback moved lastMsgAt; the heartbeat would hide a quiet house")
+	}
+}
+
+// The probe only proves anything if the engine is subscribed to it, on every
+// connect, and actually sends it.
+func TestLoopbackIsSubscribedAndPublished(t *testing.T) {
+	useTempHealthFile(t)
+	c := &fakeClient{open: true}
+	e := newTestEngine(c)
+
+	if err := e.SubscribeAll(); err != nil {
+		t.Fatalf("SubscribeAll: %v", err)
+	}
+	e.watchdogTick(time.Now())
+
+	has := func(list []string) bool {
+		for _, topic := range list {
+			if topic == e.loopbackTopic {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(c.topics(func(f *fakeClient) []string { return f.subscribed })) {
+		t.Fatal("SubscribeAll did not subscribe to the loopback topic")
+	}
+	if !has(c.topics(func(f *fakeClient) []string { return f.published })) {
+		t.Fatal("watchdog tick did not publish the loopback probe")
+	}
+}
+
+// A deaf client goes unhealthy first and is rebuilt second, in that order:
+// between the two thresholds the verdict is already sour but the connection
+// is left alone.
+func TestDeafClientIsUnhealthyThenRebuilt(t *testing.T) {
+	useTempHealthFile(t)
+	now := time.Now()
+
+	c := &fakeClient{open: true}
+	e := newTestEngine(c)
+	factory, built := countingFactory(func() mqtt.Client { return &fakeClient{} })
+	e.SetClientFactory(factory)
+
+	e.heard(now, unhealthyTimeout+30*time.Second, time.Hour)
+	e.watchdogTick(now)
+	if got := readFile(t, healthPath); got != "unhealthy\n" {
+		t.Fatalf("silent past unhealthyTimeout wrote %q, want unhealthy", got)
+	}
+	if *built != 0 {
+		t.Fatalf("reconnected %d time(s) before stallTimeout, want 0", *built)
+	}
+
+	e.heard(now, stallTimeout+30*time.Second, time.Hour)
+	e.watchdogTick(now)
+	if *built != 1 {
+		t.Fatalf("reconnected %d time(s) past stallTimeout, want 1", *built)
+	}
+}
+
+// reconnect() must not touch the liveness clock. It used to reset it to space
+// out retries; with the verdict now evaluated every tick, that reset would
+// make a wedged engine read healthy after every attempt and autoheal would
+// never fire. Retries are spaced by their own timestamp instead.
+func TestRecoveryIsSpacedWithoutFakingLiveness(t *testing.T) {
+	useTempHealthFile(t)
+	now := time.Now()
+
+	c := &fakeClient{open: true}
+	e := newTestEngine(c)
+	// Replacements connect but stay deaf: nothing ever arrives.
+	factory, built := countingFactory(func() mqtt.Client { return &fakeClient{} })
+	e.SetClientFactory(factory)
+	e.heard(now, 2*stallTimeout, time.Hour)
+
+	e.watchdogTick(now)
+	e.watchdogTick(now.Add(watchdogInterval))
+	e.watchdogTick(now.Add(2 * watchdogInterval))
+
+	if *built != 1 {
+		t.Fatalf("built %d replacement clients across three ticks, want 1 (backoff)", *built)
+	}
+	if got := readFile(t, healthPath); got != "unhealthy\n" {
+		t.Fatalf("still-deaf engine wrote %q after a recovery attempt, want unhealthy", got)
+	}
+
+	e.watchdogTick(now.Add(recoveryBackoff + watchdogInterval))
+	if *built != 2 {
+		t.Fatalf("built %d replacement clients after the backoff, want 2", *built)
+	}
+}
+
+// A recovery that works must read ok on the next tick, not a heartbeat later:
+// the healthcheck gives up after three failures two minutes apart.
+func TestVerdictClearsAsSoonAsTheProbeReturns(t *testing.T) {
+	useTempHealthFile(t)
+	now := time.Now()
+
+	e := newTestEngine(&fakeClient{open: true})
 	e.SetClientFactory(func() mqtt.Client { return &fakeClient{} })
+	e.heard(now, 2*stallTimeout, time.Hour)
+	e.watchdogTick(now) // unhealthy, reconnects
 
-	e.mu.Lock()
-	e.lastMsgAt = time.Now().Add(-2 * stallTimeout)
-	e.mu.Unlock()
+	e.handleMessage(e.loopbackTopic, []byte("1")) // the probe comes back
 
-	e.reconnect()
-
-	e.mu.Lock()
-	age := time.Since(e.lastMsgAt)
-	e.mu.Unlock()
-
-	if age > time.Minute {
-		t.Fatalf("lastMsgAt not reset (age %s); watchdog would re-fire immediately", age)
+	e.watchdogTick(time.Now())
+	if got := readFile(t, healthPath); got != "ok\n" {
+		t.Fatalf("verdict after the probe returned is %q, want ok", got)
 	}
 }
 
@@ -316,7 +489,7 @@ func readFile(t *testing.T, p string) string {
 }
 
 // The health verdict must sour well before the recovery threshold. Keying it
-// on `stalled` (20m) is why a twenty-minute deafness reported healthy the whole
+// on `stalled` (then 20m) is why a twenty-minute deafness reported healthy the whole
 // time on 2026-08-25 -- the container looked fine while receiving nothing.
 func TestHealthThresholdIsTighterThanTheRecoveryThreshold(t *testing.T) {
 	if unhealthyTimeout >= stallTimeout {
@@ -326,36 +499,52 @@ func TestHealthThresholdIsTighterThanTheRecoveryThreshold(t *testing.T) {
 	}
 }
 
-// The verdict the heartbeat writes, evaluated exactly as heartbeatLoop does.
-func healthVerdict(connected bool, lastMsgAt, startedAt time.Time) bool {
-	silent := !lastMsgAt.IsZero() && time.Since(lastMsgAt) > unhealthyTimeout
-	neverHeard := lastMsgAt.IsZero() && time.Since(startedAt) > unhealthyTimeout
-	return connected && !silent && !neverHeard
-}
-
 func TestHealthVerdictCases(t *testing.T) {
-	now := time.Now()
 	cases := []struct {
 		name      string
 		connected bool
-		lastMsgAt time.Time
-		startedAt time.Time
+		silence   time.Duration
 		want      bool
 	}{
-		{"connected and recently heard", true, now.Add(-time.Minute), now.Add(-time.Hour), true},
-		{"disconnected", false, now.Add(-time.Minute), now.Add(-time.Hour), false},
-		{"connected but silent past the threshold", true, now.Add(-unhealthyTimeout - time.Minute), now.Add(-time.Hour), false},
-		{"silent but still inside the threshold", true, now.Add(-unhealthyTimeout + time.Minute), now.Add(-time.Hour), true},
-		// A fresh process that has heard nothing yet is not a fault: a quiet
-		// house is quiet, and failing here would fail its own boot.
-		{"never heard anything, just started", true, time.Time{}, now.Add(-time.Minute), true},
-		{"never heard anything, up a long time", true, time.Time{}, now.Add(-time.Hour), false},
+		{"connected and recently heard", true, time.Minute, true},
+		{"disconnected", false, time.Minute, false},
+		{"connected but silent past the threshold", true, unhealthyTimeout + time.Minute, false},
+		{"silent but still inside the threshold", true, unhealthyTimeout - time.Minute, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := healthVerdict(tc.connected, tc.lastMsgAt, tc.startedAt); got != tc.want {
+			if got := isHealthy(tc.connected, tc.silence); got != tc.want {
 				t.Fatalf("verdict = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// A fresh process has heard nothing yet. That is not a fault until it has had
+// unhealthyTimeout to hear its first probe -- failing sooner would fail its
+// own boot -- and it IS a fault after that, which is the "subscriptions did
+// not survive" case.
+func TestFreshProcessGetsAFullThresholdToHearItself(t *testing.T) {
+	useTempHealthFile(t)
+	e := newTestEngine(&fakeClient{open: true})
+	started := e.startedAt
+
+	e.watchdogTick(started.Add(time.Minute))
+	if got := readFile(t, healthPath); got != "ok\n" {
+		t.Fatalf("one minute after start wrote %q, want ok", got)
+	}
+
+	e.watchdogTick(started.Add(unhealthyTimeout + time.Minute))
+	if got := readFile(t, healthPath); got != "unhealthy\n" {
+		t.Fatalf("never heard anything after the threshold wrote %q, want unhealthy", got)
+	}
+}
+
+// The probe has to arrive several times inside each threshold, or one lost
+// QoS 0 message would be enough to sour the verdict.
+func TestProbeIntervalLeavesRoomForLostProbes(t *testing.T) {
+	if unhealthyTimeout < 4*watchdogInterval {
+		t.Fatalf("unhealthyTimeout (%s) allows fewer than four probes at %s",
+			unhealthyTimeout, watchdogInterval)
 	}
 }
