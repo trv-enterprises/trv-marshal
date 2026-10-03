@@ -27,17 +27,37 @@ const (
 	// obvious within a few minutes rather than hours.
 	heartbeatInterval = 5 * time.Minute
 
-	// stallTimeout is how long the engine tolerates a nominally-connected
-	// client delivering nothing before it forces a reconnect.
+	// watchdogInterval is how often the engine publishes its loopback probe,
+	// re-evaluates the health verdict, and checks whether recovery is needed.
 	//
-	// This is a liveness backstop, not a traffic expectation: the trigger is
-	// silence on a connection paho believes is up, which is the signature of a
-	// half-open socket the broker has already discarded. Zigbee devices here
-	// report at least on a periodic heartbeat, so five minutes of total
-	// silence across every subscribed topic is a fault rather than a quiet
-	// house. Was 20m; shortened after the 2026-08-27 double stall, where the
-	// long window meant up to twenty dark minutes per occurrence.
+	// The verdict used to be written only by the heartbeat. That made a single
+	// unhealthy verdict stand for a full heartbeatInterval -- longer than the
+	// container healthcheck's three retries -- so one bad reading restarted
+	// the container and self-recovery never got the chance to clear it.
+	// Evaluating every watchdogInterval lets a successful recovery read "ok"
+	// within one loopback round trip.
+	watchdogInterval = 30 * time.Second
+
+	// stallTimeout is how long the engine tolerates a nominally-connected
+	// client delivering nothing -- not even its own loopback probe -- before
+	// it forces a reconnect.
+	//
+	// Silence means silence on EVERY subscription including the loopback, not
+	// silence from the devices. Until 2026-10-03 it was measured on device
+	// traffic alone, on the assumption that some Zigbee device always reports
+	// within five minutes. That is false for this house: Zigbee2MQTT's own log
+	// shows gaps of four to twelve minutes are routine. A quiet house read as
+	// a half-open socket, and autoheal restarted the container 25-39 times a
+	// day, discarding hold timers and overrides each time. The loopback
+	// arrives every watchdogInterval whatever the house is doing, so ten
+	// missed in a row is a fault.
 	stallTimeout = 5 * time.Minute
+
+	// recoveryBackoff is the minimum spacing between recovery attempts. The
+	// watchdog ticks far more often than a reconnect can prove itself, and
+	// every attempt builds a new client, so attempts are spaced rather than
+	// repeated on each tick.
+	recoveryBackoff = 5 * time.Minute
 
 	// inboxDepth bounds the internal message queue between paho's router and
 	// the engine's serial dispatcher. Sized for bursts (Z2M can publish
@@ -69,18 +89,21 @@ const (
 	//
 	// The two thresholds answer different questions. stallTimeout (5m) gates
 	// RECOVERY and is the longer of the two to avoid thrashing a connection
-	// that is merely quiet. unhealthyTimeout gates the health VERDICT and
+	// over a few lost probes. unhealthyTimeout gates the health VERDICT and
 	// must sour first: on 2026-08-25 the engine was deaf for twenty minutes
 	// while the container reported healthy the whole time, because the
 	// verdict was keyed on `stalled`. Reporting unhealthy sooner lets
 	// recovery attempt the repair first, and the healthcheck's own retries
 	// add further delay before anything restarts.
+	//
+	// Like stallTimeout, this is silence on the loopback as well as on the
+	// devices: six missed probes, never a quiet house.
 	unhealthyTimeout = 3 * time.Minute
 )
 
-// healthPath is where each heartbeat records its verdict for the
+// healthPath is where each watchdog tick records its verdict for the
 // container healthcheck to read. Under /tmp because it is genuinely
-// ephemeral: it is rewritten every heartbeat and means nothing across a
+// ephemeral: it is rewritten every tick and means nothing across a
 // restart. Nothing outside the container reads it, so it is not a bind mount.
 //
 // A var rather than a const solely so tests can redirect it to a temp dir.
@@ -138,6 +161,25 @@ type Engine struct {
 	cmdCount   uint64
 	sweepCount uint64
 	startedAt  time.Time
+
+	// loopbackTopic is where this process publishes a probe to itself every
+	// watchdogInterval. A probe that comes back proves the whole inbound
+	// chain -- broker, subscription, paho's router, the inbox, the dispatcher
+	// -- independently of whether any device has anything to say.
+	loopbackTopic string
+
+	// lastInboundAt is when anything last arrived, device message or loopback.
+	// It is the liveness signal for both the health verdict and recovery, and
+	// is only ever set by a real arrival (or to startedAt, so a fresh process
+	// gets a full threshold to hear its first probe). lastMsgAt above stays
+	// device-only so the heartbeat still shows how quiet the house is.
+	lastInboundAt  time.Time
+	lastLoopbackAt time.Time
+
+	// lastRecoveryAt spaces recovery attempts. Kept separate from
+	// lastInboundAt on purpose: faking the liveness signal to buy a retry
+	// delay would make a wedged engine report healthy after every attempt.
+	lastRecoveryAt time.Time
 }
 
 // mqttPublisher adapts the paho MQTT client to the alerter.Publisher interface.
@@ -158,18 +200,38 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 	tracker := state.NewTracker()
 	pub := &mqttPublisher{client: client}
 	a := alerter.New(pub, cfg.AlertTopic)
+	now := time.Now()
 
 	return &Engine{
-		cfg:        cfg,
-		client:     client,
-		tracker:    tracker,
-		actuators:  actuator.NewTracker(),
-		alerter:    a,
-		configPath: configPath,
-		stopSweep:  make(chan struct{}),
-		inbox:      make(chan inboundMsg, inboxDepth),
-		startedAt:  time.Now(),
+		cfg:           cfg,
+		client:        client,
+		tracker:       tracker,
+		actuators:     actuator.NewTracker(),
+		alerter:       a,
+		configPath:    configPath,
+		stopSweep:     make(chan struct{}),
+		inbox:         make(chan inboundMsg, inboxDepth),
+		startedAt:     now,
+		loopbackTopic: newLoopbackTopic(),
+		lastInboundAt: now,
 	}
+}
+
+// newLoopbackTopic names the probe topic for this process. Host and pid, the
+// same suffix main gives the client ID, so two overlapping instances -- a
+// redeploy that briefly runs both -- cannot keep each other looking alive.
+func newLoopbackTopic() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("marshal/loopback/%s-%d", host, os.Getpid())
+}
+
+// subscriptions is every topic the engine must be subscribed to: what the
+// config requires, plus the loopback probe.
+func (e *Engine) subscriptions() []string {
+	return append(e.cfg.Topics(), e.loopbackTopic)
 }
 
 // inboundMsg is one MQTT message awaiting dispatch.
@@ -219,8 +281,7 @@ func (e *Engine) swapClient(c mqtt.Client) {
 	e.alerter.SetPublisher(&mqttPublisher{client: c})
 }
 
-// Start subscribes to MQTT topics and begins the sweep ticker.
-// Start begins the sweep and heartbeat loops.
+// Start begins the dispatch, sweep, heartbeat and watchdog loops.
 //
 // Deliberately does NOT subscribe: the OnConnect handler already calls
 // SubscribeAll on every connect, the initial one included. Subscribing here
@@ -228,16 +289,17 @@ func (e *Engine) swapClient(c mqtt.Client) {
 // logs (each topic "subscribed" twice) but it meant every inbound message was
 // processed twice, so an edge-triggered action published its command twice.
 func (e *Engine) Start() error {
-	// Seed the health file before the first heartbeat. Start is only reached
-	// once the initial connect and subscribe have both succeeded, so "ok" is
-	// accurate here -- and without it the container would read as unhealthy
-	// for the whole first heartbeatInterval, which is a normal boot rather
-	// than a fault.
+	// Seed the health file before the first watchdog tick. Start is only
+	// reached once the initial connect and subscribe have both succeeded, so
+	// "ok" is accurate here -- and without it the container would read as
+	// unhealthy until that first tick, which is a normal boot rather than a
+	// fault.
 	e.writeHealth(true)
 
 	go e.dispatchLoop()
 	go e.sweepLoop()
 	go e.heartbeatLoop()
+	go e.watchdogLoop()
 	return nil
 }
 
@@ -255,7 +317,7 @@ func (e *Engine) Start() error {
 // Re-subscribing explicitly from OnConnect sidesteps paho's store entirely.
 // Subscribing to a topic that is already subscribed is harmless.
 func (e *Engine) SubscribeAll() error {
-	topics := e.cfg.Topics()
+	topics := e.subscriptions()
 	slog.Info("subscribing to topics", "count", len(topics))
 
 	for _, topic := range topics {
@@ -280,7 +342,7 @@ func (e *Engine) SubscribeAll() error {
 func (e *Engine) Stop() {
 	close(e.stopSweep)
 
-	topics := e.cfg.Topics()
+	topics := e.subscriptions()
 	for _, topic := range topics {
 		token := e.client.Unsubscribe(topic)
 		token.Wait()
@@ -358,9 +420,22 @@ func (e *Engine) Reload() error {
 func (e *Engine) handleMessage(topic string, payload []byte) {
 	now := time.Now()
 
+	// The loopback probe is liveness only. It is deliberately consumed here,
+	// after the inbox and on the dispatcher, so its arrival proves the whole
+	// chain a device message travels -- and deliberately kept out of
+	// msgCount/lastMsgAt, which report what the house is doing.
+	if topic == e.loopbackTopic {
+		e.mu.Lock()
+		e.lastInboundAt = now
+		e.lastLoopbackAt = now
+		e.mu.Unlock()
+		return
+	}
+
 	e.mu.Lock()
 	e.msgCount++
 	e.lastMsgAt = now
+	e.lastInboundAt = now
 	e.mu.Unlock()
 
 	e.handleControl(topic, payload, now)
@@ -557,10 +632,15 @@ func parseEnableWord(word string) (bool, bool) {
 // commands are published because -- as far as the engine knows -- nothing has
 // happened. On 2026-08-22 the engine went ten hours without reacting to
 // motion and the only evidence was the absence of log lines, which is not
-// something you can alert on. A heartbeat turns that absence into a signal:
-// `messages` counts what actually arrived from the broker, so repeated
-// heartbeats reporting zero while devices are known to be publishing is a
-// stall, and `last_message_age` says how long it has been going on.
+// something you can alert on. A heartbeat turns that absence into a signal.
+//
+// Read the two ages together. `last_message_age_sec` is the house: a large
+// value with `loopback_age_sec` small is simply quiet. `loopback_age_sec`
+// growing past a couple of watchdog intervals is the engine going deaf, and
+// that -- not device silence -- is what `stalled` reports.
+//
+// The heartbeat only reports. The verdict and recovery live in watchdogLoop,
+// which runs often enough to notice a repair before the healthcheck gives up.
 func (e *Engine) heartbeatLoop() {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
@@ -572,35 +652,27 @@ func (e *Engine) heartbeatLoop() {
 		case <-e.stopSweep:
 			return
 		case <-ticker.C:
+			now := time.Now()
+
 			e.mu.Lock()
+			client := e.client
 			msgs, cmds, sweeps := e.msgCount, e.cmdCount, e.sweepCount
-			lastMsgAt, startedAt := e.lastMsgAt, e.startedAt
+			lastMsgAt, lastLoopbackAt := e.lastMsgAt, e.lastLoopbackAt
+			lastInboundAt, startedAt := e.lastInboundAt, e.startedAt
 			e.mu.Unlock()
 
 			sinceLast := msgs - lastMsgCount
 			lastMsgCount = msgs
-
-			// Age of the most recent inbound message. Reported as -1 when the
-			// engine has never received one, which is distinct from "a long
-			// time ago" and usually means subscriptions did not survive a
-			// reconnect.
-			ageSec := -1.0
-			if !lastMsgAt.IsZero() {
-				ageSec = time.Since(lastMsgAt).Seconds()
-			}
 
 			// IsConnected() reports paho's *intent* to hold a session, not
 			// the health of the socket. With auto-reconnect enabled it keeps
 			// returning true while the reconnect machinery believes it owns a
 			// connection -- so a client evicted by the broker reports healthy
 			// indefinitely. Treat prolonged silence as the real signal.
-			connected := e.client.IsConnected()
-			stalled := connected && !lastMsgAt.IsZero() && time.Since(lastMsgAt) > stallTimeout
+			connected := client.IsConnected()
+			stalled := isStalled(connected, now.Sub(lastInboundAt))
 
 			level := slog.LevelInfo
-			// No messages in a whole interval is not automatically wrong --
-			// a quiet house is quiet -- but combined with a lost connection
-			// it is worth surfacing louder.
 			if !connected || stalled {
 				level = slog.LevelError
 			}
@@ -610,66 +682,134 @@ func (e *Engine) heartbeatLoop() {
 				"stalled", stalled,
 				"messages_total", msgs,
 				"messages_since_last_heartbeat", sinceLast,
-				"last_message_age_sec", ageSec,
+				"last_message_age_sec", ageSec(lastMsgAt, now),
+				"loopback_age_sec", ageSec(lastLoopbackAt, now),
 				"commands_total", cmds,
 				"sweeps_total", sweeps,
-				"uptime_sec", time.Since(startedAt).Seconds(),
+				"uptime_sec", now.Sub(startedAt).Seconds(),
 			)
-
-			// Publish the same verdict to disk for the container healthcheck.
-			//
-			// Written on every heartbeat, healthy or not: the file's mtime is
-			// what proves the heartbeat loop is still running at all. A
-			// process wedged somewhere else entirely would leave a stale
-			// "healthy" file, and a check that only read the contents would
-			// believe it.
-			// Health verdict, deliberately NOT the same test as recovery.
-			//
-			// `stalled` is keyed on stallTimeout (20m) because that gates
-			// reconnection, where thrashing is worse than waiting. The health
-			// verdict needs to sour sooner: a client that has heard nothing
-			// for unhealthyTimeout is not healthy, whatever paho's connection
-			// status claims. Keying this on `stalled` is why a twenty-minute
-			// deafness reported healthy throughout on 2026-08-25.
-			//
-			// lastMsgAt.IsZero() means nothing has EVER arrived; that is only
-			// unhealthy once the process has been up long enough to expect
-			// something, otherwise a quiet start would fail its own boot.
-			silent := !lastMsgAt.IsZero() && time.Since(lastMsgAt) > unhealthyTimeout
-			neverHeard := lastMsgAt.IsZero() && time.Since(startedAt) > unhealthyTimeout
-			e.writeHealth(connected && !silent && !neverHeard)
-
-			// Recover whenever the client is not usable, not only when it is
-			// stalled.
-			//
-			// Gating this on `stalled` alone is unrecoverable by
-			// construction: `stalled` requires connected == true, so the
-			// moment a recovery attempt leaves the client disconnected there
-			// is no condition left that can ever fire again. That is exactly
-			// how the engine sat offline for fourteen hours on 2026-08-23,
-			// logging an ERROR heartbeat every five minutes with nothing
-			// acting on it.
-			if stalled || !connected {
-				slog.Error("MQTT unhealthy, reconnecting",
-					"reason", map[bool]string{true: "stalled", false: "disconnected"}[stalled],
-					"silent_for_sec", ageSec,
-					"threshold_sec", stallTimeout.Seconds(),
-				)
-				e.reconnect()
-			}
 		}
+	}
+}
+
+// ageSec is the age of a timestamp in seconds, or -1 when it has never been
+// set. -1 on last_message_age_sec means no device message has ever arrived;
+// on loopback_age_sec it means the probe has never come back, which usually
+// means subscriptions did not survive a reconnect.
+func ageSec(t, now time.Time) float64 {
+	if t.IsZero() {
+		return -1
+	}
+	return now.Sub(t).Seconds()
+}
+
+// isHealthy is the verdict written for the container healthcheck: paho says
+// connected AND something -- at minimum the loopback probe -- has arrived
+// within unhealthyTimeout. Deliberately NOT the same test as recovery; see
+// unhealthyTimeout.
+func isHealthy(connected bool, silence time.Duration) bool {
+	return connected && silence <= unhealthyTimeout
+}
+
+// isStalled reports a client paho believes is connected that has delivered
+// nothing for stallTimeout: the signature of a half-open socket.
+func isStalled(connected bool, silence time.Duration) bool {
+	return connected && silence > stallTimeout
+}
+
+// needsRecovery is true whenever the client is not usable, not only when it
+// is stalled.
+//
+// Gating recovery on `stalled` alone is unrecoverable by construction:
+// `stalled` requires connected == true, so the moment a recovery attempt
+// leaves the client disconnected there is no condition left that can ever
+// fire again. That is exactly how the engine sat offline for fourteen hours
+// on 2026-08-23, logging an ERROR heartbeat every five minutes with nothing
+// acting on it.
+func needsRecovery(connected bool, silence time.Duration) bool {
+	return !connected || isStalled(connected, silence)
+}
+
+// watchdogLoop proves the connection is alive, records the verdict, and
+// repairs the connection when it is not.
+func (e *Engine) watchdogLoop() {
+	ticker := time.NewTicker(watchdogInterval)
+	defer ticker.Stop()
+
+	// First probe straight away, so a healthy boot has heard itself long
+	// before the first verdict is due.
+	e.publishLoopback()
+
+	for {
+		select {
+		case <-e.stopSweep:
+			return
+		case <-ticker.C:
+			e.watchdogTick(time.Now())
+		}
+	}
+}
+
+// watchdogTick is one pass of the watchdog: verdict, recovery if due, probe.
+func (e *Engine) watchdogTick(now time.Time) {
+	e.mu.Lock()
+	client := e.client
+	silence := now.Sub(e.lastInboundAt)
+	sinceRecovery := now.Sub(e.lastRecoveryAt)
+	e.mu.Unlock()
+
+	connected := client.IsConnected()
+
+	// Written on every tick, healthy or not: the file's mtime is what proves
+	// this loop is still running at all. A process wedged somewhere else
+	// entirely would leave a stale "ok", and a check that only read the
+	// contents would believe it.
+	e.writeHealth(isHealthy(connected, silence))
+
+	if needsRecovery(connected, silence) && sinceRecovery >= recoveryBackoff {
+		slog.Error("MQTT unhealthy, reconnecting",
+			"reason", map[bool]string{true: "stalled", false: "disconnected"}[connected],
+			"silent_for_sec", silence.Seconds(),
+			"threshold_sec", stallTimeout.Seconds(),
+		)
+		e.reconnect()
+	}
+
+	// Probe after any recovery, so a repaired connection proves itself on
+	// this tick rather than the next.
+	e.publishLoopback()
+}
+
+// publishLoopback sends the probe that handleMessage consumes.
+//
+// QoS 0: the point is whether it comes BACK, and an acknowledged publish
+// proves nothing about the inbound half -- the half that fails silently. A
+// failed publish is only logged; the missing arrival is what the watchdog
+// acts on.
+func (e *Engine) publishLoopback() {
+	e.mu.Lock()
+	client := e.client
+	e.mu.Unlock()
+
+	token := client.Publish(e.loopbackTopic, 0, false, "1")
+	if !token.WaitTimeout(publishWait) {
+		slog.Warn("loopback publish timed out", "topic", e.loopbackTopic)
+		return
+	}
+	if err := token.Error(); err != nil {
+		slog.Warn("loopback publish failed", "topic", e.loopbackTopic, "error", err)
 	}
 }
 
 // reconnect tears down the current MQTT session and establishes a new one.
 //
-// Used by the stall watchdog to recover a half-open socket. The inbound
-// counter is reset first so a reconnect that itself fails silently does not
-// immediately re-trigger the watchdog on the next tick -- lastMsgAt is set to
-// now, giving the fresh connection a full stallTimeout to prove itself.
+// Used by the watchdog to recover a half-open socket. The attempt is stamped
+// first so a reconnect that itself fails silently is not repeated on the very
+// next tick. lastInboundAt is deliberately left alone: only a real arrival may
+// move it, otherwise every attempt would make a deaf engine read healthy.
 func (e *Engine) reconnect() {
 	e.mu.Lock()
-	e.lastMsgAt = time.Now()
+	e.lastRecoveryAt = time.Now()
 	factory := e.newClient
 	old := e.client
 	e.mu.Unlock()
@@ -695,19 +835,20 @@ func (e *Engine) reconnect() {
 	fresh := factory()
 	if fresh == nil {
 		// The factory already logged why. Returning here leaves the engine on
-		// the old client, which the next heartbeat will try to recover again.
-		slog.Error("no replacement MQTT client, will retry on next heartbeat")
+		// the old client, which the watchdog will try to recover again once
+		// the backoff allows.
+		slog.Error("no replacement MQTT client, will retry after backoff")
 		return
 	}
 
 	token := fresh.Connect()
 	if !token.WaitTimeout(connectWait) {
-		slog.Error("MQTT reconnect timed out, will retry on next heartbeat",
+		slog.Error("MQTT reconnect timed out, will retry after backoff",
 			"waited_sec", connectWait.Seconds())
 		return
 	}
 	if err := token.Error(); err != nil {
-		slog.Error("MQTT reconnect failed, will retry on next heartbeat", "error", err)
+		slog.Error("MQTT reconnect failed, will retry after backoff", "error", err)
 		return
 	}
 
@@ -726,30 +867,30 @@ func (e *Engine) finishReconnect(c mqtt.Client) {
 	if !c.IsConnected() {
 		token := c.Connect()
 		if !token.WaitTimeout(connectWait) {
-			slog.Error("MQTT reconnect timed out, will retry on next heartbeat")
+			slog.Error("MQTT reconnect timed out, will retry after backoff")
 			return
 		}
 		if err := token.Error(); err != nil {
-			slog.Error("MQTT reconnect failed, will retry on next heartbeat", "error", err)
+			slog.Error("MQTT reconnect failed, will retry after backoff", "error", err)
 			return
 		}
 	}
 
 	if err := e.SubscribeAll(); err != nil {
-		// Connected but deaf -- the same silent failure the heartbeat exists
-		// to catch. Left as-is deliberately: the next heartbeat sees no
-		// inbound messages and drives another recovery.
-		slog.Error("resubscribe after recovery failed, will retry on next heartbeat", "error", err)
+		// Connected but deaf -- the same silent failure the watchdog exists
+		// to catch. Left as-is deliberately: the loopback will not come back,
+		// so the watchdog drives another recovery once the backoff allows.
+		slog.Error("resubscribe after recovery failed, will retry after backoff", "error", err)
 		return
 	}
 	slog.Info("MQTT recovered")
 }
 
-// writeHealth records the latest heartbeat verdict where the container
+// writeHealth records the latest watchdog verdict where the container
 // healthcheck can read it.
 //
 // The file carries "ok" or "unhealthy", and its mtime carries the liveness of
-// the heartbeat loop itself. The healthcheck requires both: recent content AND
+// the watchdog loop itself. The healthcheck requires both: recent content AND
 // a recent write. Content alone would keep reporting the last verdict forever
 // if this goroutine died; mtime alone would not notice a client that is up but
 // deaf.
