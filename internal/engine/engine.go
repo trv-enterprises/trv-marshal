@@ -402,6 +402,14 @@ func (e *Engine) Reload() error {
 			slog.Info("removed actuation state for deleted rule", "rule", name)
 		}
 	}
+	// An alert switched inactive stops being tracked. Its state is dropped
+	// rather than left to go stale, so switching it back on starts the hold
+	// from scratch. No "resolved" is sent for an alert that was firing.
+	for _, r := range newCfg.Rules {
+		if r.Alert != nil && !r.Alert.IsActive() {
+			e.tracker.RemoveRule(r.Name)
+		}
+	}
 
 	// Update alerter if alert_topic changed
 	if newCfg.AlertTopic != e.cfg.AlertTopic {
@@ -457,7 +465,7 @@ func (e *Engine) handleMessage(topic string, payload []byte) {
 		}
 
 		// Alert path: level-triggered, unchanged semantics.
-		if rule.Alert != nil {
+		if rule.Alert != nil && rule.Alert.IsActive() {
 			action := e.tracker.Update(rule.Name, conditionMet, rule.Alert.DurationMinutes, rule.Alert.RepeatMinutes, now, conditionMet)
 			e.processAction(action, rule, now)
 		}
@@ -469,9 +477,10 @@ func (e *Engine) handleMessage(topic string, payload []byte) {
 	}
 }
 
-// handleControl applies override and enable messages for any rule whose
-// control topics match. An override message marks manual ownership; an enable
-// message parks or resumes automation.
+// handleControl applies override, enable and active messages for any rule
+// whose control topics match. An override message marks manual ownership; an
+// enable message parks or resumes automation; an active message switches
+// whether the action may start new cycles.
 func (e *Engine) handleControl(topic string, payload []byte, now time.Time) {
 	overrideRules, enableRules := e.cfg.RulesForControlTopic(topic)
 
@@ -496,6 +505,28 @@ func (e *Engine) handleControl(topic string, payload []byte, now time.Time) {
 		e.actuators.SetEnabled(rule.Name, enabled, now)
 		slog.Info("automation enable changed", "rule", rule.Name, "enabled", enabled)
 		e.publishOwnerState(rule, now)
+	}
+
+	for _, rule := range e.cfg.RulesForActiveTopic(topic) {
+		// An empty payload is what a subscriber sees when the retained value
+		// is cleared: the decision goes back to the configured default.
+		if strings.TrimSpace(string(payload)) == "" {
+			if e.actuators.ClearActive(rule.Name) {
+				slog.Info("action active reset to configured default",
+					"rule", rule.Name, "active", rule.Action.IsActive())
+			}
+			continue
+		}
+		active, ok := parseActive(payload)
+		if !ok {
+			slog.Warn("unparseable active payload", "rule", rule.Name, "payload", string(payload))
+			continue
+		}
+		// Logged only on a change: the value is retained, so the broker
+		// replays it on every subscribe.
+		if e.actuators.SetActive(rule.Name, active) {
+			slog.Info("action active changed", "rule", rule.Name, "active", active)
+		}
 	}
 }
 
@@ -526,8 +557,18 @@ func (e *Engine) gateOK(rule config.Rule, conditionMet bool, payload []byte) boo
 // processActuation runs the edge-triggered action path for one rule.
 func (e *Engine) processActuation(rule config.Rule, conditionMet, gateOK bool, now time.Time) {
 	a := rule.Action
+
+	// An inactive action is handled exactly like a failed gate, because that
+	// is the behaviour wanted: no on-command on the rising edge, the edge
+	// still recorded, and the off path untouched so a cycle already running
+	// finishes. Ownership is not consulted or changed.
+	active := e.actuators.Active(rule.Name, a.IsActive())
+	if conditionMet && !active {
+		slog.Debug("action inactive, not turning on", "rule", rule.Name)
+	}
+
 	cmds := e.actuators.Evaluate(
-		rule.Name, conditionMet, gateOK,
+		rule.Name, conditionMet, gateOK && active,
 		a.Topic, a.Payload,
 		a.OffTopicOrDefault(), a.OffPayload,
 		a.OffDelaySeconds, a.OverrideTTLMinutes,
@@ -583,6 +624,21 @@ func (e *Engine) publishOwnerState(rule config.Rule, now time.Time) {
 	}
 }
 
+// parseActive interprets an active-topic payload. Same two wire forms as
+// parseEnable -- a bare word, or a JSON object, here {"active": <v>} -- plus
+// the words "active" and "inactive".
+func parseActive(payload []byte) (bool, bool) {
+	return parseSwitch(payload, "active", func(word string) (bool, bool) {
+		switch strings.ToLower(strings.TrimSpace(word)) {
+		case "active":
+			return true, true
+		case "inactive":
+			return false, true
+		}
+		return parseEnableWord(word)
+	})
+}
+
 // parseEnable interprets an enable-topic payload as a boolean. Two wire
 // forms are accepted:
 //
@@ -596,23 +652,27 @@ func (e *Engine) publishOwnerState(rule config.Rule, now time.Time) {
 // Anything else — including {} and JSON without an "enable" key — is
 // rejected, and the caller logs it rather than guessing.
 func parseEnable(payload []byte) (bool, bool) {
+	return parseSwitch(payload, "enable", parseEnableWord)
+}
+
+// parseSwitch reads a boolean from a control payload: a bare word understood
+// by word, or a JSON object whose key holds a boolean or such a word.
+func parseSwitch(payload []byte, key string, word func(string) (bool, bool)) (bool, bool) {
 	trimmed := strings.TrimSpace(string(payload))
 	if strings.HasPrefix(trimmed, "{") {
-		var obj struct {
-			Enable any `json:"enable"`
-		}
+		var obj map[string]any
 		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
 			return false, false
 		}
-		switch v := obj.Enable.(type) {
+		switch v := obj[key].(type) {
 		case bool:
 			return v, true
 		case string:
-			return parseEnableWord(v)
+			return word(v)
 		}
 		return false, false
 	}
-	return parseEnableWord(trimmed)
+	return word(trimmed)
 }
 
 func parseEnableWord(word string) (bool, bool) {
@@ -939,7 +999,7 @@ func (e *Engine) sweep() {
 
 	rules := make(map[string]struct{ DurationMin, RepeatMin int })
 	for _, r := range e.cfg.Rules {
-		if r.Alert == nil {
+		if r.Alert == nil || !r.Alert.IsActive() {
 			continue
 		}
 		rules[r.Name] = struct{ DurationMin, RepeatMin int }{r.Alert.DurationMinutes, r.Alert.RepeatMinutes}

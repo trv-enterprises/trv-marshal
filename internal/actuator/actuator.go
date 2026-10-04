@@ -11,6 +11,11 @@
 // The engine never contends with tier 4; it is what remains when the engine
 // issues no commands at all. Keeping the device's own motion rule dormant is a
 // deployment concern, not something this package enforces.
+//
+// Activation is NOT a tier. A rule's action can be switched inactive at
+// runtime, which only stops automation starting new cycles; who owns the
+// device is unaffected. The tracker just remembers the runtime value -- the
+// engine folds it into the rising-edge check alongside the gate.
 package actuator
 
 import (
@@ -63,6 +68,11 @@ type ruleState struct {
 	// command. Without this the engine overrides itself on its first action
 	// and never actuates again.
 	selfEcho int
+
+	// active is the runtime activation value from the rule's active topic;
+	// nil when none has been received, in which case the configured default
+	// applies. Deliberately untouched by SetEnabled and NoteOverride.
+	active *bool
 }
 
 // Tracker owns actuation state for all action-bearing rules.
@@ -261,6 +271,50 @@ func (t *Tracker) SetEnabled(rule string, enabled bool, now time.Time) {
 		// claim an on that a later falling edge would try to undo.
 		s.commandedOn = false
 	}
+}
+
+// SetActive records the runtime activation value for a rule and reports
+// whether it changed anything.
+//
+// The value arrives as a RETAINED message, so the broker replays it on every
+// subscribe -- twice at startup and again after each reconnect. It is state,
+// not an event: a replay of the value already held must do nothing. That is
+// also why this touches no other field. Reactivating keeps a manual override
+// that is still running, and deactivating leaves a pending off in place so a
+// cycle already under way finishes.
+func (t *Tracker) SetActive(rule string, active bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.getOrCreate(rule)
+	if s.active != nil && *s.active == active {
+		return false
+	}
+	s.active = &active
+	return true
+}
+
+// ClearActive forgets the runtime activation value, handing the decision back
+// to the configured default. Reports whether there was one to forget.
+func (t *Tracker) ClearActive(rule string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.getOrCreate(rule)
+	if s.active == nil {
+		return false
+	}
+	s.active = nil
+	return true
+}
+
+// Active reports whether the rule's action may start new cycles: the runtime
+// value when one has been received, otherwise def.
+func (t *Tracker) Active(rule string, def bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s := t.getOrCreate(rule); s.active != nil {
+		return *s.active
+	}
+	return def
 }
 
 // RemoveRule drops state for a rule that no longer exists in config.

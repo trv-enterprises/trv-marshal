@@ -54,6 +54,16 @@ type AlertSpec struct {
 	RepeatMinutes   int    `yaml:"repeat_minutes"`
 	Severity        string `yaml:"severity"`
 	Message         string `yaml:"message"`
+
+	// Active switches the alert off without deleting it. Omitted means
+	// active. It is static: whether an alert reaches a phone at runtime is
+	// sentinel's business (mute, quiet hours), not this engine's.
+	Active *bool `yaml:"active"`
+}
+
+// IsActive reports whether the alert path runs for this rule.
+func (a *AlertSpec) IsActive() bool {
+	return a.Active == nil || *a.Active
 }
 
 // ActionSpec configures the edge-triggered actuation path.
@@ -78,6 +88,21 @@ type ActionSpec struct {
 	OverrideTTLMinutes int    `yaml:"override_ttl_minutes"`
 	EnableTopic        string `yaml:"enable_topic"`
 	StateTopic         string `yaml:"state_topic"`
+
+	// Activation: "notice motion here, but leave the device alone". An
+	// inactive action issues no new on-commands. It is NOT parking: a cycle
+	// already running finishes (the scheduled off still fires), a manual
+	// override in progress is kept, and the enable topic cannot switch it
+	// back on.
+	//
+	// Active is the default, omitted meaning active. ActiveTopic, when set,
+	// carries the runtime value as a RETAINED message, which is what lets the
+	// state survive a restart with no store of its own: true/false (or
+	// {"active": <bool>}) overrides the default, and an empty retained
+	// payload -- how a retained value is cleared -- hands the decision back
+	// to Active.
+	Active      *bool  `yaml:"active"`
+	ActiveTopic string `yaml:"active_topic"`
 
 	// Gate is an optional extra condition, evaluated against the same payload
 	// as the rule condition, consulted only on the rising edge: when it fails,
@@ -256,6 +281,12 @@ func (a *ActionSpec) validate(index int, name string) error {
 	return nil
 }
 
+// IsActive reports the configured default for the action; a retained value
+// on ActiveTopic overrides it at runtime.
+func (a *ActionSpec) IsActive() bool {
+	return a.Active == nil || *a.Active
+}
+
 // OffTopicOrDefault returns the topic used for the off command.
 func (a *ActionSpec) OffTopicOrDefault() string {
 	if a.OffTopic != "" {
@@ -265,8 +296,16 @@ func (a *ActionSpec) OffTopicOrDefault() string {
 }
 
 // Topics returns the deduplicated set of MQTT topics the engine must
-// subscribe to: every rule's trigger topic plus any override/enable
-// control topics.
+// subscribe to: every rule's trigger topic plus any override, enable and
+// active control topics.
+//
+// ORDER IS LOAD-BEARING. The engine subscribes in this order, the broker
+// replays each topic's retained message as its subscription lands, and one
+// dispatcher processes them in arrival order. Zigbee2MQTT retains device
+// state, so a trigger topic subscribed before its rule's control topics lets a
+// retained `occupancy: true` be acted on -- light switched on -- before the
+// engine has heard the retained "inactive" or "parked" that was meant to stop
+// it. State-bearing control topics therefore come first.
 func (c *Config) Topics() []string {
 	seen := make(map[string]bool)
 	var topics []string
@@ -278,10 +317,15 @@ func (c *Config) Topics() []string {
 		topics = append(topics, t)
 	}
 	for _, r := range c.Rules {
+		if r.Action != nil {
+			add(r.Action.ActiveTopic)
+			add(r.Action.EnableTopic)
+		}
+	}
+	for _, r := range c.Rules {
 		add(r.Topic)
 		if r.Action != nil {
 			add(r.Action.OverrideTopic)
-			add(r.Action.EnableTopic)
 		}
 	}
 	return topics
@@ -292,6 +336,17 @@ func (c *Config) RulesForTopic(topic string) []Rule {
 	var matched []Rule
 	for _, r := range c.Rules {
 		if r.Topic == topic {
+			matched = append(matched, r)
+		}
+	}
+	return matched
+}
+
+// RulesForActiveTopic returns rules whose action is switched by this topic.
+func (c *Config) RulesForActiveTopic(topic string) []Rule {
+	var matched []Rule
+	for _, r := range c.Rules {
+		if r.Action != nil && r.Action.ActiveTopic == topic {
 			matched = append(matched, r)
 		}
 	}
