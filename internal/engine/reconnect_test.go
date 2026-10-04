@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -44,6 +45,7 @@ type fakeClient struct {
 
 	subscribed []string
 	published  []string
+	payloads   []string // parallel to published
 }
 
 func (f *fakeClient) IsConnectionOpen() bool {
@@ -99,7 +101,21 @@ func (f *fakeClient) Publish(topic string, qos byte, retained bool, payload inte
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.published = append(f.published, topic)
+	f.payloads = append(f.payloads, fmt.Sprintf("%s", payload))
 	return &fakeToken{}
+}
+
+// sentTo returns the payloads published to one topic, in order.
+func (f *fakeClient) sentTo(topic string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for i, t := range f.published {
+		if t == topic {
+			out = append(out, f.payloads[i])
+		}
+	}
+	return out
 }
 
 func (f *fakeClient) topics(of func(*fakeClient) []string) []string {

@@ -324,3 +324,75 @@ func TestActionGateRequiresValue(t *testing.T) {
 		t.Fatal("expected error for gate without value")
 	}
 }
+
+func TestActiveDefaultsToTrueAndCanBeSwitchedOff(t *testing.T) {
+	cfg, err := Load(writeTemp(t, mqttHeader+`
+  - name: defaults
+    topic: "zigbee2mqtt/a"
+    condition: {field: occupancy, operator: eq, value: true}
+    alert: {severity: info, message: "m"}
+    action: {topic: "zigbee2mqtt/a/set", payload: "ON"}
+  - name: switched_off
+    topic: "zigbee2mqtt/b"
+    condition: {field: occupancy, operator: eq, value: true}
+    alert: {severity: info, message: "m", active: false}
+    action: {topic: "zigbee2mqtt/b/set", payload: "ON", active: false, active_topic: "automation/b/active"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, off := cfg.Rules[0], cfg.Rules[1]
+	if !on.Alert.IsActive() || !on.Action.IsActive() {
+		t.Fatal("alert and action must be active when `active` is omitted")
+	}
+	if off.Alert.IsActive() || off.Action.IsActive() {
+		t.Fatal("`active: false` was not honoured")
+	}
+	if got := cfg.RulesForActiveTopic("automation/b/active"); len(got) != 1 || got[0].Name != "switched_off" {
+		t.Fatalf("RulesForActiveTopic = %+v, want the switched_off rule", got)
+	}
+}
+
+// Retained control values must reach the engine before retained device state,
+// and the engine subscribes in Topics() order. A trigger topic ahead of its
+// rule's active or enable topic would let a retained `occupancy: true` switch
+// a light on before the engine has heard it is inactive or parked.
+func TestTopicsPutStateBearingControlTopicsFirst(t *testing.T) {
+	cfg, err := Load(writeTemp(t, mqttHeader+`
+  - name: one
+    topic: "zigbee2mqtt/one"
+    condition: {field: occupancy, operator: eq, value: true}
+    action:
+      topic: "zigbee2mqtt/one/set"
+      payload: "ON"
+      override_topic: "zigbee2mqtt/one/set"
+      override_ttl_minutes: 30
+      enable_topic: "automation/enable"
+      active_topic: "automation/one/active"
+  - name: two
+    topic: "zigbee2mqtt/two"
+    condition: {field: occupancy, operator: eq, value: true}
+    action:
+      topic: "zigbee2mqtt/two/set"
+      payload: "ON"
+      enable_topic: "automation/enable"
+      active_topic: "automation/two/active"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := map[string]int{}
+	for i, tp := range cfg.Topics() {
+		pos[tp] = i
+	}
+	if len(pos) != 6 {
+		t.Fatalf("Topics() = %v, want 6 distinct topics", cfg.Topics())
+	}
+	for _, control := range []string{"automation/enable", "automation/one/active", "automation/two/active"} {
+		for _, trigger := range []string{"zigbee2mqtt/one", "zigbee2mqtt/two"} {
+			if pos[control] > pos[trigger] {
+				t.Fatalf("%q comes after %q in Topics(): %v", control, trigger, cfg.Topics())
+			}
+		}
+	}
+}

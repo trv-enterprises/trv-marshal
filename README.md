@@ -73,6 +73,10 @@ An alert fires once the condition has been **continuously true** for
 Alerts publish to the global `alert_topic` (`sensors/alerts`) as JSON with a
 `type` of `new`, `repeat`, or `resolved`.
 
+Add `active: false` to switch an alert off without deleting it. This is a
+static setting: whether an alert that *does* fire reaches a phone is decided
+downstream (mutes, quiet hours), not here.
+
 **Message variables:** `{duration}` `{device}` `{name}` `{field}` `{value}`
 
 ---
@@ -146,6 +150,37 @@ Precedence, highest first:
 parked  >  override (TTL)  >  automation
 ```
 
+### Active / inactive
+
+"Tell me about motion here, but leave the light alone." An inactive action
+issues no new on-commands. The rule's alert is not affected.
+
+```yaml
+      active: true                                  # the default; omit it
+      active_topic: "automation/hallway/active"     # optional runtime switch
+```
+
+- **`active`** — the configured default. `false` ships the action switched
+  off. A rule whose alert and action are both inactive does nothing at all.
+- **`active_topic`** — publish `true` / `false` here to switch at runtime
+  (also `on`, `off`, `active`, `inactive`, or `{"active": false}`). Publish it
+  **retained**: the broker replays it on every subscribe, which is how the
+  setting survives an engine restart. Clear the retained value (an empty
+  retained payload) to hand the decision back to `active`.
+
+Inactive is deliberately not the same as parked:
+
+| | inactive | parked |
+|---|---|---|
+| New on-commands | no | no |
+| A cycle already running | finishes: the scheduled off still fires | dropped: the light stays on |
+| A manual override in progress | kept when switched back to active | cleared by enable `true` |
+| Scope | one rule, via its own `active_topic` | every rule sharing the `enable_topic` |
+
+The two are independent. Enable `true` never reactivates an inactive action,
+and neither affects who owns the device, so `state_topic` does not report
+inactive.
+
 ---
 
 ## Both at once
@@ -191,6 +226,8 @@ Worth knowing before you design around it:
 - **No time-of-day or day-of-week.** "Only after sunset" is not expressible;
   the closest is testing a lux/illuminance field the device already reports.
 - **No cooldown on actions** beyond `off_delay_seconds`.
+- **`active_topic` is per rule.** There is no group form; use `enable_topic`
+  to switch several rules together.
 - **One alert topic** for every rule.
 - **YAML only** — no UI, no API, no runtime rule entry.
 

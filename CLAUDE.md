@@ -174,6 +174,30 @@ Two non-obvious rules:
   consume those echoes or it overrides itself on its first command and goes
   permanently dormant. See `internal/actuator/selfov_test.go`.
 
+### Activation is not ownership
+
+An action can be switched inactive (`active: false`, or a retained message on
+its `active_topic`). It is implemented as one more input to the rising-edge
+check, alongside the gate, and nothing else — which is what gives it the
+agreed behaviour: no new on-commands, a running cycle still finishes, a manual
+override is kept, and the enable topic cannot switch it back on. Do not turn it
+into an ownership tier; parking already exists and behaves differently on
+every one of those points.
+
+Two things it depends on:
+
+- **The active message is state, not an event.** It is retained, so the broker
+  replays it on every subscribe. `SetActive` must stay a no-op for a value it
+  already holds. The enable topic is the opposite on purpose — "on" while
+  already enabled is how an override is ended early — so do not "fix" enable to
+  match.
+- **`Config.Topics()` order is load-bearing.** The engine subscribes in that
+  order and the broker replays retained messages as each subscription lands.
+  Zigbee2MQTT retains device state, so a trigger topic subscribed before its
+  rule's `active_topic` / `enable_topic` lets retained motion switch a light on
+  before the engine has heard it is inactive or parked. Verified against a
+  real broker on 2026-10-03: v0.4.2 switched on a parked light at startup.
+
 Worked example with full reasoning: `docs/nightlight-automation.md`.
 
 ## Build and release
