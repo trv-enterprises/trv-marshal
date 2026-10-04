@@ -1,7 +1,8 @@
 # Marshal — Writing Rules
 
 A rule watches one MQTT topic, tests one field, and then **alerts**, **acts**,
-or both. This document is about writing those rules.
+or both. This document is about writing those rules, and about the one thing
+in the file that is not a rule: the `reassert` list.
 
 Rules live in YAML and are the **only** way to configure the engine — there is
 no UI and no API. Edit the file, then deploy (or `SIGHUP` to reload in place).
@@ -203,6 +204,45 @@ rather than two:
 
 ---
 
+## Reassert — say it again on a schedule
+
+Some settings a device forgets without telling anyone. A rule cannot help:
+nothing changes on any topic when it happens, so there is no condition to
+test. `reassert` is a separate, top-level list of messages that Marshal
+publishes at startup, after every reload, and then again on an interval.
+
+```yaml
+reassert:
+  - name: park_local_rule_hall
+    topic: "zigbee2mqtt/bridge/request/device/write"
+    payload: '{"id":"night-light-hall","endpoint":1,"cluster":64512,"options":{"manufacturerCode":4877},"payload":{"coldDownTime":5,"localRoutinTime":0,"luxThreshold":100}}'
+    every_minutes: 60
+```
+
+- **`name`** — unique among reassert entries; it appears in the log.
+- **`topic`** — where to publish. No wildcards: nothing is subscribed.
+- **`payload`** — sent verbatim, QoS 1, not retained.
+- **`every_minutes`** — the interval, at least 1. This is how long a setting
+  can stay wrong before it is put back.
+
+The example is what the list was built for. A Third Reality night light can
+run motion→light by itself; writing `localRoutinTime: 0` parks that so it
+cannot race the rule that owns the light. The device does not answer reads on
+that cluster, so the setting cannot be checked, and it has reverted with no
+power cycle or rejoin to explain it. The symptom is easy to miss: with the
+rule's action active the light comes on either way. It shows only when the
+action is switched inactive and the light comes on regardless.
+
+A publish that fails is tried again within 30 seconds rather than after the
+whole interval, and nothing is attempted while the broker connection is down.
+Each success is logged as `reasserted`. Marshal does not read any reply, so a
+write the device rejects is not noticed here.
+
+Choosing the interval: shorter means less time wrong, but each publish may be
+a write to a device's flash. Hourly is a reasonable default.
+
+---
+
 ## Reloading
 
 `SIGHUP` reloads the rules file without restarting the process or losing rule
@@ -213,7 +253,8 @@ docker kill -s HUP services-marshal-1
 ```
 
 Topics are diffed on reload — new ones are subscribed, removed ones
-unsubscribed, and state for deleted rules is dropped.
+unsubscribed, and state for deleted rules is dropped. Every `reassert` entry
+is published again within 30 seconds, changed or not.
 
 ---
 
@@ -228,6 +269,8 @@ Worth knowing before you design around it:
 - **No cooldown on actions** beyond `off_delay_seconds`.
 - **`active_topic` is per rule.** There is no group form; use `enable_topic`
   to switch several rules together.
+- **`reassert` is blind.** It publishes on a timer and reads no reply; it
+  cannot tell whether a device took the write or had drifted at all.
 - **One alert topic** for every rule.
 - **YAML only** — no UI, no API, no runtime rule entry.
 

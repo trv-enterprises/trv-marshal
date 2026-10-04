@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad(t *testing.T) {
@@ -394,5 +395,70 @@ func TestTopicsPutStateBearingControlTopicsFirst(t *testing.T) {
 				t.Fatalf("%q comes after %q in Topics(): %v", control, trigger, cfg.Topics())
 			}
 		}
+	}
+}
+
+// One rule to follow mqttHeader (which ends with "rules:"), so a top-level
+// reassert section can come after it.
+const reassertRule = `  - name: garage
+    topic: "zigbee2mqtt/garage"
+    condition: {field: contact, operator: eq, value: false}
+    alert: {duration_minutes: 30, severity: warning, message: "open"}
+`
+
+func TestReassertLoads(t *testing.T) {
+	cfg, err := Load(writeTemp(t, mqttHeader+reassertRule+`
+reassert:
+  - name: hall_local_rule
+    topic: "zigbee2mqtt/bridge/request/device/write"
+    payload: '{"id":"night-light-hall","endpoint":1,"cluster":64512,"payload":{"localRoutinTime":0}}'
+    every_minutes: 60
+  - {name: desk, topic: "plug/desk/set", payload: "ON", every_minutes: 1}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Reassert) != 2 {
+		t.Fatalf("got %d reassert entries", len(cfg.Reassert))
+	}
+	r := cfg.Reassert[0]
+	if r.Name != "hall_local_rule" || r.Topic != "zigbee2mqtt/bridge/request/device/write" || r.Every() != time.Hour {
+		t.Fatalf("entry %+v", r)
+	}
+	if r.Payload != `{"id":"night-light-hall","endpoint":1,"cluster":64512,"payload":{"localRoutinTime":0}}` {
+		t.Fatalf("payload not kept verbatim: %q", r.Payload)
+	}
+	// Nothing to subscribe to: the engine's subscription order is untouched.
+	for _, tp := range cfg.Topics() {
+		if tp == r.Topic || tp == "plug/desk/set" {
+			t.Fatalf("reassert topic %q is in Topics(): it is published to, never subscribed", tp)
+		}
+	}
+	// A config without the section is the config Marshal has always had.
+	if cfg, err := Load(writeTemp(t, mqttHeader+reassertRule)); err != nil || len(cfg.Reassert) != 0 {
+		t.Fatalf("no reassert section: %+v err=%v", cfg, err)
+	}
+}
+
+func TestReassertValidation(t *testing.T) {
+	bad := map[string]string{
+		"no name":           `  - {topic: "a/b", payload: "x", every_minutes: 5}`,
+		"no topic":          `  - {name: n, payload: "x", every_minutes: 5}`,
+		"no payload":        `  - {name: n, topic: "a/b", every_minutes: 5}`,
+		"no interval":       `  - {name: n, topic: "a/b", payload: "x"}`,
+		"zero interval":     `  - {name: n, topic: "a/b", payload: "x", every_minutes: 0}`,
+		"negative interval": `  - {name: n, topic: "a/b", payload: "x", every_minutes: -5}`,
+		"wildcard topic":    `  - {name: n, topic: "zigbee2mqtt/+/set", payload: "x", every_minutes: 5}`,
+		"multi-level topic": `  - {name: n, topic: "zigbee2mqtt/#", payload: "x", every_minutes: 5}`,
+		"duplicate name":    "  - {name: n, topic: \"a/b\", payload: \"x\", every_minutes: 5}\n  - {name: n, topic: \"c/d\", payload: \"y\", every_minutes: 5}",
+	}
+	for name, entry := range bad {
+		if _, err := Load(writeTemp(t, mqttHeader+reassertRule+"reassert:\n"+entry+"\n")); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// A reassert entry may share a name with a rule: they are separate lists.
+	if _, err := Load(writeTemp(t, mqttHeader+reassertRule+"reassert:\n  - {name: garage, topic: \"a/b\", payload: \"x\", every_minutes: 5}\n")); err != nil {
+		t.Errorf("same name as a rule: %v", err)
 	}
 }

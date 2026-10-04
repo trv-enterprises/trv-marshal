@@ -80,3 +80,14 @@ rules:
     action:
       topic: "notify/siren/set"
       payload: '{"state":"ON"}'
+
+# Not a rule: messages published at startup, after a reload, and then every
+# `every_minutes`. For settings a device forgets without saying so. This one
+# keeps a Third Reality night light's own motion-to-light rule parked
+# (localRoutinTime 0) so it cannot race hallway_motion_light above; the device
+# cannot be asked what it holds, so the only defence is to say it again.
+reassert:
+  - name: park_local_rule_my_light
+    topic: "zigbee2mqtt/bridge/request/device/write"
+    payload: '{"id":"my_light","endpoint":1,"cluster":64512,"options":{"manufacturerCode":4877},"payload":{"coldDownTime":5,"localRoutinTime":0,"luxThreshold":100}}'
+    every_minutes: 60

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,6 +15,51 @@ type Config struct {
 	MQTT       MQTTConfig `yaml:"mqtt"`
 	AlertTopic string     `yaml:"alert_topic"`
 	Rules      []Rule     `yaml:"rules"`
+	Reassert   []Reassert `yaml:"reassert"`
+}
+
+// Reassert is a message published again and again on a fixed interval: at
+// startup, after a reload, and every EveryMinutes after that.
+//
+// It exists for settings a device silently forgets. The night lights keep
+// their own motion-to-light rule parked only for as long as a private
+// attribute stays written; the device cannot be asked what it holds, and on
+// 2026-10-04 one reverted with no power cycle, rejoin or update to show for
+// it. The only defence against drift that cannot be observed is to say the
+// same thing again on a schedule.
+//
+// It is not conditional and not edge-triggered: it has no topic to watch and
+// takes no part in ownership. A rule's action is the tool for reacting to
+// something; this is for holding something still.
+type Reassert struct {
+	Name         string `yaml:"name"`
+	Topic        string `yaml:"topic"`
+	Payload      string `yaml:"payload"`
+	EveryMinutes int    `yaml:"every_minutes"`
+}
+
+// Every is the interval between publishes.
+func (r Reassert) Every() time.Duration {
+	return time.Duration(r.EveryMinutes) * time.Minute
+}
+
+func (r Reassert) validate(index int) error {
+	if r.Name == "" {
+		return fmt.Errorf("reassert[%d]: name is required", index)
+	}
+	if r.Topic == "" {
+		return fmt.Errorf("reassert[%d] (%s): topic is required", index, r.Name)
+	}
+	if strings.ContainsAny(r.Topic, "+#") {
+		return fmt.Errorf("reassert[%d] (%s): topic %q has a wildcard; it is published to, not subscribed", index, r.Name, r.Topic)
+	}
+	if r.Payload == "" {
+		return fmt.Errorf("reassert[%d] (%s): payload is required", index, r.Name)
+	}
+	if r.EveryMinutes < 1 {
+		return fmt.Errorf("reassert[%d] (%s): every_minutes must be at least 1", index, r.Name)
+	}
+	return nil
 }
 
 // MQTTConfig holds MQTT broker connection settings.
@@ -191,6 +238,19 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rule[%d]: duplicate name %q", i, r.Name)
 		}
 		names[r.Name] = true
+	}
+
+	// Reassert names are their own namespace: they key the engine's
+	// schedule, and never appear in an alert or beside a rule.
+	reasserts := make(map[string]bool)
+	for i, r := range c.Reassert {
+		if err := r.validate(i); err != nil {
+			return err
+		}
+		if reasserts[r.Name] {
+			return fmt.Errorf("reassert[%d]: duplicate name %q", i, r.Name)
+		}
+		reasserts[r.Name] = true
 	}
 
 	return nil
