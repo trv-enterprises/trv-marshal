@@ -43,6 +43,9 @@ type fakeClient struct {
 	// that cannot reach the broker.
 	connectFails error
 
+	// publishErr makes every Publish report this error on its token.
+	publishErr error
+
 	subscribed []string
 	published  []string
 	payloads   []string // parallel to published
@@ -102,7 +105,7 @@ func (f *fakeClient) Publish(topic string, qos byte, retained bool, payload inte
 	defer f.mu.Unlock()
 	f.published = append(f.published, topic)
 	f.payloads = append(f.payloads, fmt.Sprintf("%s", payload))
-	return &fakeToken{}
+	return &fakeToken{err: f.publishErr}
 }
 
 // sentTo returns the payloads published to one topic, in order.

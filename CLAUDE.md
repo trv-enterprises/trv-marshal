@@ -198,6 +198,31 @@ Two things it depends on:
   before the engine has heard it is inactive or parked. Verified against a
   real broker on 2026-10-03: v0.4.2 switched on a parked light at startup.
 
+### Reassert is neither alerting nor actuation
+
+`reassert` (v0.6.0) publishes fixed messages on a timer: at startup, after a
+reload, every `every_minutes`. It is its own loop (`reassertLoop`, a check
+every `reassertTick`) and deliberately shares nothing with the two paths
+above: no condition, no edge, no ownership, no subscription. Keep it that
+way.
+
+- **Why it exists.** On 2026-10-04 the media-room night light's on-device
+  motion rule, parked by writing `localRoutinTime: 0` to private cluster
+  0xFC00, was found active again: parked through about sixty motion events
+  overnight, active by midday, with no rejoin, power cycle or OTA in the
+  Zigbee2MQTT log. The device does not answer reads on that cluster, so
+  drift cannot be detected, only overwritten. Until then the Ansible role
+  wrote it once per deploy.
+- **It adds no topics to `Config.Topics()`.** That order is load-bearing
+  (above) and reassert only publishes. Do not start reading the bridge's
+  response topic without thinking that through.
+- **The schedule is a map of name to next-due time, and an absent name is due
+  now.** Startup and reload both rely on the map being empty; `Reload` swaps
+  `cfg` and resets the map under `mu` together. A failed publish leaves the
+  entry due, so the retry is one tick away, not one interval.
+- **It skips the whole pass while the client is down.** Each publish would
+  otherwise wait out `publishWait`, entry after entry, on a dead client.
+
 Worked example with full reasoning: `docs/nightlight-automation.md`.
 
 ## Build and release

@@ -84,6 +84,11 @@ const (
 	// message processing until the watchdog fires.
 	publishWait = 10 * time.Second
 
+	// reassertTick is how often the reassert schedule is checked. It bounds
+	// how late an entry can be, how soon a reload takes effect, and how soon
+	// a failed publish is retried; the entries' own intervals are in minutes.
+	reassertTick = 30 * time.Second
+
 	// unhealthyTimeout is when silence starts being reported as UNHEALTHY to
 	// the container healthcheck. Deliberately shorter than stallTimeout.
 	//
@@ -180,6 +185,12 @@ type Engine struct {
 	// lastInboundAt on purpose: faking the liveness signal to buy a retry
 	// delay would make a wedged engine report healthy after every attempt.
 	lastRecoveryAt time.Time
+
+	// reassertDue is when each reassert entry is next to be published, by
+	// name. An entry with no time here is due now, which is how startup and
+	// a reload publish everything: the map starts, and is reset, empty.
+	// Protected by mu.
+	reassertDue map[string]time.Time
 }
 
 // mqttPublisher adapts the paho MQTT client to the alerter.Publisher interface.
@@ -214,6 +225,7 @@ func New(cfg *config.Config, client mqtt.Client, configPath string) *Engine {
 		startedAt:     now,
 		loopbackTopic: newLoopbackTopic(),
 		lastInboundAt: now,
+		reassertDue:   make(map[string]time.Time),
 	}
 }
 
@@ -300,6 +312,7 @@ func (e *Engine) Start() error {
 	go e.sweepLoop()
 	go e.heartbeatLoop()
 	go e.watchdogLoop()
+	go e.reassertLoop()
 	return nil
 }
 
@@ -418,8 +431,14 @@ func (e *Engine) Reload() error {
 		slog.Info("alert topic changed", "old", e.cfg.AlertTopic, "new", newCfg.AlertTopic)
 	}
 
+	// Swap the config and forget the reassert schedule together: every
+	// entry is then due, so a reload re-publishes all of them on the next
+	// tick, changed or not. That is the point of reloading them.
+	e.mu.Lock()
 	e.cfg = newCfg
-	slog.Info("config reloaded", "rules", len(newCfg.Rules))
+	e.reassertDue = make(map[string]time.Time)
+	e.mu.Unlock()
+	slog.Info("config reloaded", "rules", len(newCfg.Rules), "reassert", len(newCfg.Reassert))
 	return nil
 }
 
@@ -683,6 +702,67 @@ func parseEnableWord(word string) (bool, bool) {
 		return false, true
 	}
 	return false, false
+}
+
+// reassertLoop publishes the config's reassert entries on their intervals.
+//
+// It checks every reassertTick rather than sleeping until the next entry is
+// due, so a reload (which makes everything due) and a failed publish (which
+// leaves an entry due) are both picked up within one tick without any
+// signalling between goroutines. Start runs it only after the first connect
+// and subscribe have succeeded, so the first pass goes out at once.
+func (e *Engine) reassertLoop() {
+	e.reassert(time.Now())
+
+	ticker := time.NewTicker(reassertTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopSweep:
+			return
+		case now := <-ticker.C:
+			e.reassert(now)
+		}
+	}
+}
+
+// reassert publishes every entry that is due at now.
+//
+// An entry whose publish fails stays due, so it is retried on the next tick
+// instead of waiting out a whole interval: the interval is how long drift is
+// allowed to last, and a broker hiccup should not double it. While the client
+// is down nothing is attempted at all -- each publish would otherwise wait
+// out its full timeout, entry after entry -- and everything stays due for the
+// first tick after recovery.
+func (e *Engine) reassert(now time.Time) {
+	e.mu.Lock()
+	client := e.client
+	var due []config.Reassert
+	for _, r := range e.cfg.Reassert {
+		if !now.Before(e.reassertDue[r.Name]) {
+			due = append(due, r)
+		}
+	}
+	e.mu.Unlock()
+
+	if len(due) == 0 || !client.IsConnectionOpen() {
+		return
+	}
+	for _, r := range due {
+		token := client.Publish(r.Topic, 1, false, r.Payload)
+		if !token.WaitTimeout(publishWait) {
+			slog.Warn("reassert publish timed out, will retry", "name", r.Name, "topic", r.Topic)
+			continue
+		}
+		if err := token.Error(); err != nil {
+			slog.Warn("reassert publish failed, will retry", "name", r.Name, "topic", r.Topic, "error", err)
+			continue
+		}
+		e.mu.Lock()
+		e.reassertDue[r.Name] = now.Add(r.Every())
+		e.mu.Unlock()
+		slog.Info("reasserted", "name", r.Name, "topic", r.Topic, "next_in_minutes", r.EveryMinutes)
+	}
 }
 
 // heartbeatLoop emits a periodic liveness record.
